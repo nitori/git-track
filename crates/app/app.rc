@@ -1,0 +1,4 @@
+// Windows resources. gpui loads icon #1 as the window/taskbar icon,
+// the tray uses #1 and #2 (shown while something is unpushed).
+1 ICON "assets/git-track.ico"
+2 ICON "assets/git-track-alert.ico"

@@ -1,0 +1,10 @@
+fn main() {
+    println!("cargo:rerun-if-changed=app.rc");
+    println!("cargo:rerun-if-changed=assets/git-track.ico");
+    println!("cargo:rerun-if-changed=assets/git-track-alert.ico");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        embed_resource::compile("app.rc", embed_resource::NONE)
+            .manifest_optional()
+            .expect("failed to compile Windows resources");
+    }
+}

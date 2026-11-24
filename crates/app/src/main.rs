@@ -2,22 +2,28 @@
 
 mod actions;
 mod config;
+mod instance;
 mod scanner;
 mod scrollbar;
+mod tray;
 
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
+use futures::channel::mpsc::UnboundedReceiver;
 use git_track_core::{Event, PROTOCOL_VERSION, RepoStatus, Severity};
 use gpui::{
-    AnyView, App, Application, Bounds, ClipboardItem, Context, Corner, Div, ElementId, FontWeight,
-    Hsla, MouseButton, MouseDownEvent, SharedString, Stateful, Subscription, Task, TitlebarOptions,
-    Window, WindowBounds, WindowOptions, anchored, deferred, div, point, prelude::*, px, rgb, size,
+    AnyView, App, Application, Bounds, ClipboardItem, Context, Corner, Div, ElementId, FocusHandle,
+    FontWeight, Hsla, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, SharedString,
+    Stateful, Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions,
+    anchored, deferred, div, point, prelude::*, px, rgb, size,
 };
 
 use config::Config;
 use scanner::{Msg, SourceKind};
+
+actions!(git_track, [Quit]);
 
 mod colors {
     pub const BG: u32 = 0x1e1f22;
@@ -174,6 +180,30 @@ impl Source {
     }
 }
 
+struct Summary {
+    total: usize,
+    dirty: usize,
+    scanning: bool,
+}
+
+impl Summary {
+    fn text(&self) -> (String, u32) {
+        let dirty = self.dirty;
+        if dirty > 0 {
+            let noun = if dirty == 1 {
+                "repository"
+            } else {
+                "repositories"
+            };
+            (format!("{dirty} {noun} with unpushed work"), DANGER)
+        } else if self.scanning && self.total == 0 {
+            ("scanning…".to_string(), DIM)
+        } else {
+            ("everything is pushed".to_string(), OK)
+        }
+    }
+}
+
 struct GitTrack {
     config: Config,
     config_error: Option<String>,
@@ -187,17 +217,71 @@ struct GitTrack {
     notice: Option<String>,
     last_full_refresh: Instant,
     scrollbar: scrollbar::Scrollbar,
-    config_menu_open: bool,
+    menu_open: bool,
+    focus: FocusHandle,
+    /// Present while closing the window hides it to the tray.
+    tray: Option<tray::Tray>,
+    _commands_task: Task<()>,
     _ticker: Task<()>,
     _activation: Subscription,
 }
 
 impl GitTrack {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        instance_commands: UnboundedReceiver<tray::Command>,
+    ) -> Self {
         let (config, config_error) = match Config::load() {
             Ok(config) => (config, None),
             Err(e) => (Config::default(), Some(e)),
         };
+
+        let mut notice = None;
+        let (tray, tray_commands) = if config.close_to_tray {
+            match tray::Tray::new() {
+                Ok((tray, commands)) => (Some(tray), Some(commands)),
+                Err(e) => {
+                    notice = Some(format!("No tray icon, closing the window quits: {e}"));
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        // Commands from the tray icon and from instances started later.
+        let mut commands = futures::stream::select(
+            tray_commands.unwrap_or_else(|| futures::channel::mpsc::unbounded().1),
+            instance_commands,
+        );
+        let commands_task = cx.spawn_in(window, async move |this, cx| {
+            while let Some(command) = commands.next().await {
+                let alive = this.update_in(cx, |this, window, cx| match command {
+                    tray::Command::Show => tray::show_window(window),
+                    tray::Command::Quit => this.quit(cx),
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // With a tray icon, closing only hides the window.
+        let weak = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            let to_tray = weak
+                .update(cx, |this, cx| {
+                    this.menu_open = false;
+                    cx.notify();
+                    this.tray.is_some()
+                })
+                .unwrap_or(false);
+            !(to_tray && tray::hide_window(window))
+        });
+
+        let focus = cx.focus_handle();
+        window.focus(&focus);
 
         let activation = cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
@@ -233,15 +317,43 @@ impl GitTrack {
             show_clean: false,
             busy: HashSet::new(),
             touched: HashSet::new(),
-            notice: None,
+            notice,
             last_full_refresh: Instant::now(),
             scrollbar: scrollbar::Scrollbar::default(),
-            config_menu_open: false,
+            menu_open: false,
+            focus,
+            tray,
+            _commands_task: commands_task,
             _ticker: ticker,
             _activation: activation,
         };
         this.start_all(cx);
         this
+    }
+
+    /// Quits the application (instead of hiding to the tray).
+    fn quit(&mut self, cx: &mut Context<Self>) {
+        // Remove the tray icon explicitly; it would linger until hovered otherwise.
+        self.tray = None;
+        cx.quit();
+    }
+
+    fn summary(&self) -> Summary {
+        let enabled = || self.sources.iter().filter(|s| self.config.enabled(s.kind));
+        Summary {
+            total: enabled().map(|s| s.repos.len()).sum(),
+            dirty: enabled().map(|s| s.dirty_count()).sum(),
+            scanning: enabled().any(|s| s.scanning()),
+        }
+    }
+
+    /// Mirrors the summary in the tray tooltip and icon.
+    fn sync_tray(&mut self) {
+        let summary = self.summary();
+        if let Some(tray) = &mut self.tray {
+            let tooltip = format!("git-track: {}", summary.text().0);
+            tray.update(&tooltip, summary.dirty > 0);
+        }
     }
 
     fn source(&self, kind: SourceKind) -> &Source {
@@ -282,6 +394,7 @@ impl GitTrack {
                 source.repos.clear();
             }
         }
+        self.sync_tray();
         cx.notify();
     }
 
@@ -294,6 +407,7 @@ impl GitTrack {
             while let Some(msg) = rx.next().await {
                 let alive = this.update(cx, |this, cx| {
                     this.source_mut(kind).apply_scan(msg);
+                    this.sync_tray();
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -302,6 +416,7 @@ impl GitTrack {
             }
             this.update(cx, |this, cx| {
                 this.source_mut(kind).finish_scan();
+                this.sync_tray();
                 cx.notify();
             })
             .ok();
@@ -323,6 +438,7 @@ impl GitTrack {
             while let Some(msg) = rx.next().await {
                 let alive = this.update(cx, |this, cx| {
                     this.apply_recheck(kind, msg);
+                    this.sync_tray();
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -488,39 +604,37 @@ fn dim(color: u32) -> Hsla {
 }
 
 impl GitTrack {
-    /// "Config ▾" button with a small dropdown.
-    fn render_config_menu(
-        &self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let item = |id: &'static str, label: &'static str| {
+    /// "Menu ▾" button with a small dropdown.
+    fn render_menu(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let item = |id: &'static str, label: &'static str, shortcut: Option<&'static str>| {
             div()
                 .id(id)
+                .flex()
+                .flex_row()
+                .gap_6()
                 .px_3()
                 .py_1()
                 .rounded_sm()
                 .whitespace_nowrap()
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(BUTTON_HOVER)))
-                .child(label)
+                .child(div().flex_1().child(label))
+                .children(shortcut.map(|s| div().text_color(rgb(DIM)).child(s)))
         };
         let close = |this: &mut Self, cx: &mut Context<Self>| {
-            this.config_menu_open = false;
+            this.menu_open = false;
             cx.notify();
         };
 
         div()
             .relative()
             .child(
-                button("config", "Config ▾")
-                    .tooltip(tooltip(Config::path().display().to_string()))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.config_menu_open = !this.config_menu_open;
-                        cx.notify();
-                    })),
+                button("menu", "Menu ▾").on_click(cx.listener(|this, _, _, cx| {
+                    this.menu_open = !this.menu_open;
+                    cx.notify();
+                })),
             )
-            .when(self.config_menu_open, |d| {
+            .when(self.menu_open, |d| {
                 d.child(
                     // Transparent full-window backdrop: a click anywhere else closes the menu.
                     deferred(
@@ -569,21 +683,41 @@ impl GitTrack {
                                             .shadow_lg()
                                             .text_xs()
                                             .child(
-                                                item("config-open", "Open in default editor")
-                                                    .on_click(cx.listener(
-                                                        move |this, _, _, cx| {
-                                                            cx.open_with_system(&Config::path());
-                                                            close(this, cx);
-                                                        },
-                                                    )),
+                                                div()
+                                                    .px_3()
+                                                    .py_1()
+                                                    .whitespace_nowrap()
+                                                    .text_color(rgb(DIM))
+                                                    .child(Config::path().display().to_string()),
                                             )
                                             .child(
-                                                item("config-reveal", "Show in Explorer").on_click(
-                                                    cx.listener(move |this, _, _, cx| {
-                                                        cx.reveal_path(&Config::path());
-                                                        close(this, cx);
-                                                    }),
-                                                ),
+                                                item(
+                                                    "config-open",
+                                                    "Open config in default editor",
+                                                    None,
+                                                )
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    cx.open_with_system(&Config::path());
+                                                    close(this, cx);
+                                                })),
+                                            )
+                                            .child(
+                                                item(
+                                                    "config-reveal",
+                                                    "Show config in Explorer",
+                                                    None,
+                                                )
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    cx.reveal_path(&Config::path());
+                                                    close(this, cx);
+                                                })),
+                                            )
+                                            .child(div().my_1().h(px(1.)).bg(rgb(BORDER)))
+                                            .child(
+                                                item("quit", "Quit git-track", Some("Ctrl+Q"))
+                                                    .on_click(
+                                                        cx.listener(|this, _, _, cx| this.quit(cx)),
+                                                    ),
                                             ),
                                     ),
                             )
@@ -594,32 +728,10 @@ impl GitTrack {
     }
 
     fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let enabled: Vec<&Source> = self
-            .sources
-            .iter()
-            .filter(|s| self.config.enabled(s.kind))
-            .collect();
-        let total: usize = enabled.iter().map(|s| s.repos.len()).sum();
-        let dirty: usize = enabled.iter().map(|s| s.dirty_count()).sum();
-        let scanning = enabled.iter().any(|s| s.scanning());
-
-        let (summary, color) = if dirty > 0 {
-            (
-                format!(
-                    "{dirty} {} with unpushed work",
-                    if dirty == 1 {
-                        "repository"
-                    } else {
-                        "repositories"
-                    }
-                ),
-                DANGER,
-            )
-        } else if scanning && total == 0 {
-            ("scanning…".to_string(), DIM)
-        } else {
-            ("everything is pushed".to_string(), OK)
-        };
+        let Summary {
+            total, scanning, ..
+        } = self.summary();
+        let (summary, color) = self.summary().text();
 
         div()
             .flex()
@@ -661,7 +773,7 @@ impl GitTrack {
                     cx.notify();
                 })),
             )
-            .child(self.render_config_menu(window, cx))
+            .child(self.render_menu(window, cx))
             .child(
                 button("refresh", "Refresh all")
                     .on_click(cx.listener(|this, _, _, cx| this.refresh_all(cx))),
@@ -914,6 +1026,14 @@ impl Render for GitTrack {
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
             .text_sm()
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &Quit, _, cx| this.quit(cx)))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && this.menu_open {
+                    this.menu_open = false;
+                    cx.notify();
+                }
+            }))
             // Window-wide so a scrollbar drag keeps working outside the bar.
             .on_mouse_move(cx.listener(|this, event, _, cx| {
                 if this.scrollbar.mouse_move(event) {
@@ -981,7 +1101,14 @@ impl Render for GitTrack {
 }
 
 fn main() {
+    let instance_commands = match instance::acquire() {
+        instance::Instance::Primary(commands) => commands,
+        // The running instance shows its window instead.
+        instance::Instance::Secondary => return,
+    };
+
     Application::new().run(|cx: &mut App| {
+        cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -1000,7 +1127,7 @@ fn main() {
                 window_min_size: Some(size(px(640.), px(320.))),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| GitTrack::new(window, cx)),
+            |window, cx| cx.new(|cx| GitTrack::new(window, cx, instance_commands)),
         )
         .expect("failed to open window");
         cx.activate(true);

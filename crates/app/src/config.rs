@@ -16,6 +16,10 @@ pub const DEFAULT_CONFIG: &str = r#"# git-track configuration
 # Automatic full rescan interval in seconds (0 = manual refresh only).
 refresh_interval_secs = 600
 
+# Closing the window only hides it to the system tray (quit via the tray menu,
+# "Menu ▾" → Quit or Ctrl+Q). false = no tray icon, closing quits. Needs a restart.
+close_to_tray = true
+
 # What counts as "not pushed". Set an entry to false to ignore that kind of issue.
 [track]
 staged = true           # changes added to the index
@@ -94,6 +98,7 @@ command = ["explorer.exe", "{unc}"]
 #[serde(default)]
 pub struct Config {
     pub refresh_interval_secs: u64,
+    pub close_to_tray: bool,
     pub track: TrackOptions,
     pub scan: ScanOptions,
     pub windows: WindowsConfig,
@@ -135,6 +140,7 @@ impl Default for Config {
         };
         Self {
             refresh_interval_secs: 600,
+            close_to_tray: true,
             track: TrackOptions::default(),
             scan: ScanOptions::default(),
             windows: WindowsConfig::default(),
