@@ -1,0 +1,10 @@
+[package]
+name = "git-track-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Repository discovery and unpushed-work detection for git-track"
+
+[dependencies]
+serde.workspace = true
+rayon.workspace = true

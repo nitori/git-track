@@ -1,0 +1,10 @@
+[package]
+name = "git-track-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless scanner for git-track (run inside WSL, streams NDJSON to the GUI)"
+
+[dependencies]
+git-track-core.workspace = true
+serde_json.workspace = true
