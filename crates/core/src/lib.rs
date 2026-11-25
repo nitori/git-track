@@ -62,6 +62,12 @@ pub fn scan(request: &ScanRequest, emit: &(dyn Fn(Event) + Sync)) {
         }
         for repo in &request.repos {
             let path = discover::expand_tilde(repo);
+            if discover::is_gone(&path) {
+                emit(Event::Gone {
+                    path: path.to_string_lossy().into_owned(),
+                });
+                continue;
+            }
             let root = request
                 .roots
                 .iter()

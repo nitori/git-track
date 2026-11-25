@@ -55,6 +55,16 @@ pub fn discover(root: &Path, options: &ScanOptions) -> std::io::Result<Vec<PathB
     Ok(found)
 }
 
+/// True if the repository at `repo` was deleted: its `.git` entry (or the
+/// directory itself) definitely does not exist. Other errors (permissions,
+/// unreachable drive, …) do not count as deleted.
+pub fn is_gone(repo: &Path) -> bool {
+    matches!(
+        fs::symlink_metadata(repo.join(".git")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 /// Finds the nearest directory containing a `.idea` folder, starting at
 /// `repo` and going up to `root` (inclusive). Without a root only `repo`
 /// itself is checked.
@@ -151,6 +161,23 @@ mod tests {
         opts.max_depth = Some(2);
         let found = discover(&tmp, &opts).unwrap();
         assert!(!found.iter().any(|p| p.ends_with("3")));
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn deleted_repos_are_gone() {
+        let tmp = std::env::temp_dir().join(format!("git-track-gone-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("repo/.git")).unwrap();
+        fs::create_dir_all(tmp.join("plain")).unwrap();
+        fs::create_dir_all(tmp.join("worktree")).unwrap();
+        fs::write(tmp.join("worktree/.git"), "gitdir: elsewhere\n").unwrap();
+
+        assert!(!is_gone(&tmp.join("repo")));
+        assert!(!is_gone(&tmp.join("worktree")));
+        assert!(is_gone(&tmp.join("plain"))); // only .git deleted
+        assert!(is_gone(&tmp.join("missing"))); // whole directory deleted
 
         fs::remove_dir_all(&tmp).unwrap();
     }

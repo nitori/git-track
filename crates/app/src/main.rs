@@ -9,6 +9,7 @@ mod scrollbar;
 mod tray;
 
 use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -152,6 +153,10 @@ impl Source {
                     self.seen.insert(repo.path.clone());
                     self.repos.insert(repo.path.clone(), repo);
                 }
+                // Only sent for explicitly requested repositories (re-checks).
+                Event::Gone { path } => {
+                    self.repos.remove(&path);
+                }
                 Event::RootError { root, message } => {
                     self.root_errors.push(format!("{root}: {message}"))
                 }
@@ -228,6 +233,10 @@ struct GitTrack {
     scrollbar: scrollbar::Scrollbar,
     menu: Option<OpenMenu>,
     jetbrains: jetbrains::JetBrains,
+    /// A missing-repository lookup is running.
+    pruning: bool,
+    /// Last time all WSL repositories were re-checked on window activation.
+    last_wsl_sweep: Option<Instant>,
     focus: FocusHandle,
     /// Present while closing the window hides it to the tray.
     tray: Option<tray::Tray>,
@@ -295,7 +304,7 @@ impl GitTrack {
 
         let activation = cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
-                this.recheck_touched(cx);
+                this.on_activated(cx);
             }
         });
 
@@ -312,6 +321,7 @@ impl GitTrack {
                     {
                         this.refresh_all(cx);
                     }
+                    this.prune_missing(cx);
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -332,6 +342,8 @@ impl GitTrack {
             scrollbar: scrollbar::Scrollbar::default(),
             menu: None,
             jetbrains: jetbrains::JetBrains::load(),
+            pruning: false,
+            last_wsl_sweep: None,
             focus,
             tray,
             _commands_task: commands_task,
@@ -441,11 +453,21 @@ impl GitTrack {
 
     /// Re-checks a single repository without rediscovering anything.
     fn recheck(&mut self, kind: SourceKind, path: String, cx: &mut Context<Self>) {
-        let key = (kind, path.clone());
-        if !self.busy.insert(key.clone()) {
+        self.recheck_many(kind, vec![path], cx);
+    }
+
+    /// Re-checks repositories of one source in a single scan (one agent
+    /// call for WSL). Repositories already being re-checked are skipped.
+    fn recheck_many(&mut self, kind: SourceKind, paths: Vec<String>, cx: &mut Context<Self>) {
+        let paths: Vec<String> = paths
+            .into_iter()
+            .filter(|path| self.busy.insert((kind, path.clone())))
+            .collect();
+        if paths.is_empty() {
             return;
         }
-        let mut rx = scanner::start(kind, self.config.request(kind, vec![path]), &self.config);
+        let keys: Vec<_> = paths.iter().map(|p| (kind, p.clone())).collect();
+        let mut rx = scanner::start(kind, self.config.request(kind, paths), &self.config);
         cx.spawn(async move |this, cx| {
             while let Some(msg) = rx.next().await {
                 let alive = this.update(cx, |this, cx| {
@@ -458,13 +480,84 @@ impl GitTrack {
                 }
             }
             this.update(cx, |this, cx| {
-                this.busy.remove(&key);
+                for key in &keys {
+                    this.busy.remove(key);
+                }
                 cx.notify();
             })
             .ok();
         })
         .detach();
         cx.notify();
+    }
+
+    /// Drops a deleted repository from the list.
+    fn remove_repo(&mut self, kind: SourceKind, path: &str) {
+        self.source_mut(kind).repos.remove(path);
+        self.touched.remove(&(kind, path.to_string()));
+    }
+
+    /// Removes Windows repositories whose `.git` no longer exists. Only file
+    /// lookups, on a background thread. Repositories whose root is missing
+    /// too (e.g. an unplugged drive) are kept; the next scan reports that.
+    fn prune_missing(&mut self, cx: &mut Context<Self>) {
+        if self.pruning || !self.config.enabled(SourceKind::Windows) {
+            return;
+        }
+        let repos: Vec<(String, Option<String>)> = self
+            .source(SourceKind::Windows)
+            .repos
+            .values()
+            .map(|r| (r.path.clone(), r.root.clone()))
+            .collect();
+        if repos.is_empty() {
+            return;
+        }
+        self.pruning = true;
+        let lookup = cx.background_spawn(async move {
+            repos
+                .into_iter()
+                .filter(|(path, root)| {
+                    git_track_core::discover::is_gone(Path::new(path))
+                        && root.as_deref().is_none_or(|r| Path::new(r).is_dir())
+                })
+                .map(|(path, _)| path)
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let gone = lookup.await;
+            this.update(cx, |this, cx| {
+                this.pruning = false;
+                if !gone.is_empty() {
+                    for path in &gone {
+                        this.remove_repo(SourceKind::Windows, path);
+                    }
+                    this.sync_tray();
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The window became active: catch up with what the user did meanwhile.
+    fn on_activated(&mut self, cx: &mut Context<Self>) {
+        self.prune_missing(cx);
+
+        // Checking WSL paths from Windows could wake an idle WSL VM and cannot
+        // tell "deleted" from "WSL unavailable", so let the agent re-check all
+        // listed WSL repositories instead (fast; at most once a minute).
+        let wsl = SourceKind::Wsl;
+        let sweep_due = self
+            .last_wsl_sweep
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(60));
+        if sweep_due && self.config.enabled(wsl) && !self.source(wsl).scanning() {
+            self.last_wsl_sweep = Some(Instant::now());
+            let paths = self.source(wsl).repos.keys().cloned().collect();
+            self.recheck_many(wsl, paths, cx);
+        }
+        self.recheck_touched(cx);
     }
 
     fn apply_recheck(&mut self, kind: SourceKind, msg: Msg) {
@@ -484,6 +577,7 @@ impl GitTrack {
                     self.touched.remove(&key);
                 }
             }
+            Msg::Event(Event::Gone { path }) => self.remove_repo(kind, &path),
             Msg::Event(Event::Hello {
                 version,
                 protocol,
@@ -499,9 +593,14 @@ impl GitTrack {
     }
 
     fn recheck_touched(&mut self, cx: &mut Context<Self>) {
-        let touched: Vec<_> = self.touched.iter().cloned().collect();
-        for (kind, path) in touched {
-            self.recheck(kind, path, cx);
+        for kind in SOURCES {
+            let paths = self
+                .touched
+                .iter()
+                .filter(|(k, _)| *k == kind)
+                .map(|(_, path)| path.clone())
+                .collect();
+            self.recheck_many(kind, paths, cx);
         }
     }
 

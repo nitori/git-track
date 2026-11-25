@@ -89,6 +89,11 @@ default editor* / *Show config in Explorer*). It is re-read on every full refres
   (from JetBrains Toolbox's `state.json`, or `product-info.json` in
   `%LOCALAPPDATA%\Programs` / `%ProgramFiles%\JetBrains`). WSL projects are opened
   via `\\wsl.localhost\…`. Disable with `[jetbrains] enabled = false`.
+* **Deleted repositories** (just `.git` or the whole folder) disappear from the
+  list without a full rescan: Windows repositories are looked up every 15 s and
+  when the window is activated; WSL repositories are re-checked by the agent on
+  activation (at most once a minute). A re-check (↻) of a deleted repository
+  removes it, too.
 * Click a repository name to copy its path; hover issues for details.
 * **Show clean** also lists repositories without problems.
 * **System tray**: closing the window only hides it; the app keeps scanning in

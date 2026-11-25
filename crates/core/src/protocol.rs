@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 pub fn default_exclude_dirs() -> Vec<String> {
     [
@@ -189,6 +189,11 @@ pub enum Event {
         count: usize,
     },
     Repo(RepoStatus),
+    /// A repository requested explicitly (`ScanRequest::repos`) no longer
+    /// exists: its `.git` (or the whole directory) was deleted.
+    Gone {
+        path: String,
+    },
     RootError {
         root: String,
         message: String,

@@ -201,6 +201,7 @@ fn run_text(request: &ScanRequest, show_clean: bool) -> ExitCode {
                 println!("    {marker} {}", issue.description());
             }
         }
+        Event::Gone { path } => eprintln!("not a repository (anymore): {path}"),
         Event::RootError { root, message } => eprintln!("cannot scan {root}: {message}"),
         Event::Fatal { message } => eprintln!("fatal: {message}"),
         Event::Done { elapsed_ms } => {
