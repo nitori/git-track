@@ -237,6 +237,10 @@ struct GitTrack {
     pruning: bool,
     /// Last time all WSL repositories were re-checked on window activation.
     last_wsl_sweep: Option<Instant>,
+    /// When the window last lost the focus.
+    deactivated_at: Option<Instant>,
+    /// Decided when the tray icon is pressed: the click hides the window.
+    tray_click_hides: bool,
     focus: FocusHandle,
     /// Present while closing the window hides it to the tray.
     tray: Option<tray::Tray>,
@@ -278,6 +282,22 @@ impl GitTrack {
             while let Some(command) = commands.next().await {
                 let alive = this.update_in(cx, |this, window, cx| match command {
                     tray::Command::Show => tray::show_window(window),
+                    tray::Command::Press => {
+                        // Pressing the tray icon already takes the focus away from
+                        // the window, so "was in front" means: active until just now.
+                        let recently_active = window.is_window_active()
+                            || this
+                                .deactivated_at
+                                .is_some_and(|t| t.elapsed() < Duration::from_millis(500));
+                        this.tray_click_hides = recently_active && tray::is_shown(window);
+                    }
+                    tray::Command::Toggle => {
+                        if std::mem::take(&mut this.tray_click_hides) {
+                            this.hide_to_tray(window, cx);
+                        } else {
+                            tray::show_window(window);
+                        }
+                    }
                     tray::Command::Quit => this.quit(cx),
                 });
                 if alive.is_err() {
@@ -289,14 +309,10 @@ impl GitTrack {
         // With a tray icon, closing only hides the window.
         let weak = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
-            let to_tray = weak
-                .update(cx, |this, cx| {
-                    this.menu = None;
-                    cx.notify();
-                    this.tray.is_some()
-                })
+            let hidden = weak
+                .update(cx, |this, cx| this.hide_to_tray(window, cx))
                 .unwrap_or(false);
-            !(to_tray && tray::hide_window(window))
+            !hidden
         });
 
         let focus = cx.focus_handle();
@@ -305,6 +321,8 @@ impl GitTrack {
         let activation = cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
                 this.on_activated(cx);
+            } else {
+                this.deactivated_at = Some(Instant::now());
             }
         });
 
@@ -344,6 +362,8 @@ impl GitTrack {
             jetbrains: jetbrains::JetBrains::load(),
             pruning: false,
             last_wsl_sweep: None,
+            deactivated_at: None,
+            tray_click_hides: false,
             focus,
             tray,
             _commands_task: commands_task,
@@ -352,6 +372,14 @@ impl GitTrack {
         };
         this.start_all(cx);
         this
+    }
+
+    /// Hides the window if there is a tray icon to bring it back. Returns
+    /// whether it was hidden.
+    fn hide_to_tray(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
+        self.menu = None;
+        cx.notify();
+        self.tray.is_some() && tray::hide_window(window)
     }
 
     /// Quits the application (instead of hiding to the tray).

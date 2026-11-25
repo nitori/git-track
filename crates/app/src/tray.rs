@@ -9,6 +9,10 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Show,
+    /// Left button pressed on the tray icon (decides what the click does).
+    Press,
+    /// Left click on the tray icon: hide if the window was in front, else show.
+    Toggle,
     Quit,
 }
 
@@ -26,8 +30,8 @@ mod imp {
     };
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetSystemMetrics, IsIconic, SM_CXSMICON, SM_CYSMICON, SW_HIDE, SW_RESTORE, SW_SHOW,
-        SetForegroundWindow, ShowWindow,
+        GetSystemMetrics, IsIconic, IsWindowVisible, SM_CXSMICON, SM_CYSMICON, SW_HIDE, SW_RESTORE,
+        SW_SHOW, SetForegroundWindow, ShowWindow,
     };
 
     const SHOW_ID: &str = "show";
@@ -54,11 +58,14 @@ mod imp {
             TrayIconEvent::set_event_handler(Some(move |event| {
                 if let TrayIconEvent::Click {
                     button: MouseButton::Left,
-                    button_state: MouseButtonState::Up,
+                    button_state,
                     ..
                 } = event
                 {
-                    let _ = click_tx.unbounded_send(Command::Show);
+                    let _ = click_tx.unbounded_send(match button_state {
+                        MouseButtonState::Down => Command::Press,
+                        MouseButtonState::Up => Command::Toggle,
+                    });
                 }
             }));
             MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
@@ -136,6 +143,12 @@ mod imp {
         true
     }
 
+    /// Visible and not minimized.
+    pub fn is_shown(window: &Window) -> bool {
+        hwnd(window)
+            .is_some_and(|hwnd| unsafe { IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 })
+    }
+
     /// Shows a hidden or minimized window and brings it to the front.
     pub fn show_window(window: &Window) {
         let Some(hwnd) = hwnd(window) else {
@@ -173,6 +186,10 @@ mod imp {
 
     pub fn hide_window(_window: &Window) -> bool {
         false
+    }
+
+    pub fn is_shown(_window: &Window) -> bool {
+        true
     }
 
     pub fn show_window(window: &Window) {

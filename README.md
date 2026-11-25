@@ -98,8 +98,8 @@ default editor* / *Show config in Explorer*). It is re-read on every full refres
 * **Show clean** also lists repositories without problems.
 * **System tray**: closing the window only hides it; the app keeps scanning in
   the background. The tray icon gets a red badge while something is unpushed and
-  its tooltip shows the summary. Left click shows the window, right click opens a
-  menu with *Quit*. Quit fully with "Menu ▾" → *Quit git-track* or Ctrl+Q.
+  its tooltip shows the summary. Left click toggles the window (hides it if it
+  was in front, otherwise shows it), right click opens a menu with *Quit*. Quit fully with "Menu ▾" → *Quit git-track* or Ctrl+Q.
   Set `close_to_tray = false` to get a normal window without tray icon (restart
   required).
 * **Single instance**: starting git-track again just brings the running instance
