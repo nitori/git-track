@@ -55,6 +55,22 @@ pub fn discover(root: &Path, options: &ScanOptions) -> std::io::Result<Vec<PathB
     Ok(found)
 }
 
+/// Finds the nearest directory containing a `.idea` folder, starting at
+/// `repo` and going up to `root` (inclusive). Without a root only `repo`
+/// itself is checked.
+pub fn find_idea(repo: &Path, root: Option<&Path>) -> Option<PathBuf> {
+    for dir in repo.ancestors() {
+        if dir.join(".idea").is_dir() {
+            return Some(dir.to_path_buf());
+        }
+        match root {
+            Some(root) if dir.starts_with(root) && dir != root => continue,
+            _ => return None,
+        }
+    }
+    None
+}
+
 fn walk(
     dir: &Path,
     depth: usize,
@@ -135,6 +151,35 @@ mod tests {
         opts.max_depth = Some(2);
         let found = discover(&tmp, &opts).unwrap();
         assert!(!found.iter().any(|p| p.ends_with("3")));
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn finds_idea_in_repo_or_parent_up_to_root() {
+        let tmp = std::env::temp_dir().join(format!("git-track-idea-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let root = tmp.join("root");
+        for d in [
+            ".idea",              // above the root: must be ignored
+            "root/proj/.idea",    // project with nested repos
+            "root/proj/ext/repo", // repo inside it
+            "root/own/.idea",     // repo with its own project
+            "root/plain",         // no project at all
+        ] {
+            fs::create_dir_all(tmp.join(d)).unwrap();
+        }
+
+        let find = |rel: &str, root: Option<&Path>| find_idea(&tmp.join(rel), root);
+        assert_eq!(
+            find("root/proj/ext/repo", Some(&root)),
+            Some(tmp.join("root/proj"))
+        );
+        assert_eq!(find("root/own", Some(&root)), Some(tmp.join("root/own")));
+        assert_eq!(find("root/plain", Some(&root)), None);
+        // Without a root only the repository itself counts.
+        assert_eq!(find("root/proj/ext/repo", None), None);
+        assert_eq!(find("root/own", None), Some(tmp.join("root/own")));
 
         fs::remove_dir_all(&tmp).unwrap();
     }

@@ -43,7 +43,12 @@ pub fn scan(request: &ScanRequest, emit: &(dyn Fn(Event) + Sync)) {
     pool.install(|| {
         // (repo, root it was found under)
         let mut targets: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
-        for root in &request.roots {
+        let discover_roots = if request.skip_discovery {
+            &[][..]
+        } else {
+            &request.roots[..]
+        };
+        for root in discover_roots {
             let root_path = discover::expand_tilde(root);
             match discover::discover(&root_path, options) {
                 Ok(repos) => {

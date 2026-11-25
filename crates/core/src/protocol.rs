@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 pub fn default_exclude_dirs() -> Vec<String> {
     [
@@ -48,6 +48,9 @@ pub struct ScanOptions {
     pub threads: Option<usize>,
     /// Which kinds of issues are reported.
     pub track: TrackOptions,
+    /// Look for a JetBrains project (`.idea`) in the repository or a parent
+    /// directory up to the root.
+    pub idea: bool,
 }
 
 impl Default for ScanOptions {
@@ -60,6 +63,7 @@ impl Default for ScanOptions {
             git: None,
             threads: None,
             track: TrackOptions::default(),
+            idea: true,
         }
     }
 }
@@ -164,6 +168,9 @@ pub struct ScanRequest {
     pub roots: Vec<String>,
     /// Repositories that are checked directly, without discovery.
     pub repos: Vec<String>,
+    /// Only check `repos`; `roots` then just tell which root a repository
+    /// belongs to (used for re-checks).
+    pub skip_discovery: bool,
     pub options: ScanOptions,
 }
 
@@ -212,6 +219,10 @@ pub struct RepoStatus {
     /// Set when git could not be run or failed for this repository.
     #[serde(default)]
     pub error: Option<String>,
+    /// Directory containing the JetBrains `.idea` folder this repository
+    /// belongs to (the repository itself or a parent up to the root).
+    #[serde(default)]
+    pub idea: Option<String>,
 }
 
 impl RepoStatus {

@@ -46,6 +46,13 @@ important_branches = ["main", "master"]
 # Check every local branch instead.
 check_all_branches = false
 
+# IDE button for repositories that belong to a JetBrains project (a .idea folder
+# in the repository or a parent directory up to the root). The IDE is looked up
+# in the IDEs' recent projects; if it is unknown, the button lists the installed
+# IDEs (found via JetBrains Toolbox or standard install locations).
+[jetbrains]
+enabled = true
+
 [windows]
 enabled = true
 roots = ['D:\Sources\Lichtflut']
@@ -101,9 +108,22 @@ pub struct Config {
     pub close_to_tray: bool,
     pub track: TrackOptions,
     pub scan: ScanOptions,
+    pub jetbrains: JetBrainsConfig,
     pub windows: WindowsConfig,
     pub wsl: WslConfig,
     pub actions: Vec<Action>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JetBrainsConfig {
+    pub enabled: bool,
+}
+
+impl Default for JetBrainsConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -143,6 +163,7 @@ impl Default for Config {
             close_to_tray: true,
             track: TrackOptions::default(),
             scan: ScanOptions::default(),
+            jetbrains: JetBrainsConfig::default(),
             windows: WindowsConfig::default(),
             wsl: WslConfig::default(),
             actions: vec![
@@ -229,6 +250,7 @@ impl Config {
     pub fn request(&self, kind: SourceKind, repos: Vec<String>) -> ScanRequest {
         let mut options = self.scan.clone();
         options.track = self.track.clone();
+        options.idea = self.jetbrains.enabled;
         let git = match kind {
             SourceKind::Windows => &self.windows.git,
             SourceKind::Wsl => &self.wsl.git,
@@ -237,12 +259,9 @@ impl Config {
             options.git = git.clone();
         }
         ScanRequest {
-            // Re-checks skip discovery entirely; the UI keeps the known root.
-            roots: if repos.is_empty() {
-                self.roots(kind).to_vec()
-            } else {
-                Vec::new()
-            },
+            roots: self.roots(kind).to_vec(),
+            // Re-checks skip discovery; the roots only attribute the repository.
+            skip_discovery: !repos.is_empty(),
             repos,
             options,
         }

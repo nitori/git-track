@@ -76,6 +76,10 @@ pub fn check_repo(
     if let Err(e) = fill_status(git, path, options, &mut status) {
         status.error = Some(e);
     }
+    if options.idea {
+        status.idea =
+            crate::discover::find_idea(path, root).map(|dir| dir.to_string_lossy().into_owned());
+    }
     status
 }
 

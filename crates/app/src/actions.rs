@@ -15,13 +15,18 @@ impl Vars<'_> {
     fn substitute(&self, arg: &str) -> String {
         let distro = self.distro.unwrap_or_default();
         let unc = match self.kind {
-            SourceKind::Wsl => format!(r"\\wsl.localhost\{distro}{}", self.path.replace('/', "\\")),
+            SourceKind::Wsl => unc_path(distro, self.path),
             SourceKind::Windows => self.path.to_string(),
         };
         arg.replace("{path}", self.path)
             .replace("{distro}", distro)
             .replace("{unc}", &unc)
     }
+}
+
+/// A WSL path as Windows programs see it: `\\wsl.localhost\<distro>\…`.
+pub fn unc_path(distro: &str, path: &str) -> String {
+    format!(r"\\wsl.localhost\{distro}{}", path.replace('/', "\\"))
 }
 
 pub fn launch(action: &Action, vars: &Vars) -> Result<(), String> {

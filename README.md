@@ -81,6 +81,14 @@ default editor* / *Show config in Explorer*). It is re-read on every full refres
   the config as `[[actions]]` with `{path}`, `{distro}` and `{unc}` placeholders.
   Repositories an action was launched for are re-checked automatically whenever
   the window regains focus, so they disappear right after you push.
+* **JetBrains projects**: if the repository or a parent directory (up to the
+  root) contains a `.idea` folder, a button opens that project in its IDE. The
+  IDE is taken from the IDEs' recent projects lists
+  (`%APPDATA%\JetBrains\*\options\recentProjects.xml`, the most recently used
+  one wins); if the project is in none of them, "IDE ▾" lists the installed IDEs
+  (from JetBrains Toolbox's `state.json`, or `product-info.json` in
+  `%LOCALAPPDATA%\Programs` / `%ProgramFiles%\JetBrains`). WSL projects are opened
+  via `\\wsl.localhost\…`. Disable with `[jetbrains] enabled = false`.
 * Click a repository name to copy its path; hover issues for details.
 * **Show clean** also lists repositories without problems.
 * **System tray**: closing the window only hides it; the app keeps scanning in

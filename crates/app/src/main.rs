@@ -3,6 +3,7 @@
 mod actions;
 mod config;
 mod instance;
+mod jetbrains;
 mod scanner;
 mod scrollbar;
 mod tray;
@@ -14,10 +15,10 @@ use futures::StreamExt;
 use futures::channel::mpsc::UnboundedReceiver;
 use git_track_core::{Event, PROTOCOL_VERSION, RepoStatus, Severity};
 use gpui::{
-    AnyView, App, Application, Bounds, ClipboardItem, Context, Corner, Div, ElementId, FocusHandle,
-    FontWeight, Hsla, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, SharedString,
-    Stateful, Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions,
-    anchored, deferred, div, point, prelude::*, px, rgb, size,
+    AnyElement, AnyView, App, Application, Bounds, ClipboardItem, Context, Corner, Div, ElementId,
+    FocusHandle, FontWeight, Hsla, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
+    SharedString, Stateful, Subscription, Task, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, actions, anchored, deferred, div, point, prelude::*, px, rgb, size,
 };
 
 use config::Config;
@@ -204,6 +205,14 @@ impl Summary {
     }
 }
 
+/// The dropdown that is currently open (only one at a time).
+#[derive(Clone, PartialEq, Eq)]
+enum OpenMenu {
+    Main,
+    /// IDE chooser of a repository.
+    Ide(SourceKind, String),
+}
+
 struct GitTrack {
     config: Config,
     config_error: Option<String>,
@@ -217,7 +226,8 @@ struct GitTrack {
     notice: Option<String>,
     last_full_refresh: Instant,
     scrollbar: scrollbar::Scrollbar,
-    menu_open: bool,
+    menu: Option<OpenMenu>,
+    jetbrains: jetbrains::JetBrains,
     focus: FocusHandle,
     /// Present while closing the window hides it to the tray.
     tray: Option<tray::Tray>,
@@ -272,7 +282,7 @@ impl GitTrack {
         window.on_window_should_close(cx, move |window, cx| {
             let to_tray = weak
                 .update(cx, |this, cx| {
-                    this.menu_open = false;
+                    this.menu = None;
                     cx.notify();
                     this.tray.is_some()
                 })
@@ -320,7 +330,8 @@ impl GitTrack {
             notice,
             last_full_refresh: Instant::now(),
             scrollbar: scrollbar::Scrollbar::default(),
-            menu_open: false,
+            menu: None,
+            jetbrains: jetbrains::JetBrains::load(),
             focus,
             tray,
             _commands_task: commands_task,
@@ -379,6 +390,7 @@ impl GitTrack {
             }
             Err(e) => self.config_error = Some(e),
         }
+        self.jetbrains = jetbrains::JetBrains::load();
         self.start_all(cx);
     }
 
@@ -497,11 +509,7 @@ impl GitTrack {
         let Some(action) = self.config.actions_for(kind).nth(index).cloned() else {
             return;
         };
-        let distro = self
-            .source(kind)
-            .distro
-            .clone()
-            .or_else(|| self.config.wsl.distro.clone());
+        let distro = self.distro(kind);
         let vars = actions::Vars {
             kind,
             path: &path,
@@ -514,6 +522,35 @@ impl GitTrack {
             Err(e) => self.notice = Some(e),
         }
         cx.notify();
+    }
+
+    /// Opens a JetBrains project; `repo` is re-checked on focus like after an action.
+    fn open_ide(
+        &mut self,
+        code: &str,
+        kind: SourceKind,
+        project: &str,
+        repo: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ide) = self.jetbrains.ides().iter().find(|i| i.code == code) else {
+            return;
+        };
+        match jetbrains::launch(ide, kind, project, self.distro(kind).as_deref()) {
+            Ok(()) => {
+                self.touched.insert((kind, repo));
+            }
+            Err(e) => self.notice = Some(e),
+        }
+        cx.notify();
+    }
+
+    /// WSL distribution name as reported by the agent (or configured).
+    fn distro(&self, kind: SourceKind) -> Option<String> {
+        self.source(kind)
+            .distro
+            .clone()
+            .or_else(|| self.config.wsl.distro.clone())
     }
 }
 
@@ -603,128 +640,222 @@ fn dim(color: u32) -> Hsla {
     c
 }
 
+fn menu_item(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    shortcut: Option<&'static str>,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .gap_6()
+        .px_3()
+        .py_1()
+        .rounded_sm()
+        .whitespace_nowrap()
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(BUTTON_HOVER)))
+        .child(div().flex_1().child(label.into()))
+        .children(shortcut.map(|s| div().text_color(rgb(DIM)).child(s)))
+}
+
+fn menu_label(text: impl Into<SharedString>) -> Div {
+    div()
+        .px_3()
+        .py_1()
+        .whitespace_nowrap()
+        .text_color(rgb(DIM))
+        .child(text.into())
+}
+
+fn menu_separator() -> Div {
+    div().my_1().h(px(1.)).bg(rgb(BORDER))
+}
+
+/// A dropdown below the bottom-right corner of its parent (which must be
+/// `relative`), plus a transparent full-window backdrop that calls `close`
+/// when clicked anywhere else.
+fn dropdown(
+    window: &Window,
+    close: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    items: Div,
+) -> [AnyElement; 2] {
+    let viewport = window.viewport_size();
+    [
+        deferred(
+            anchored().position(point(px(0.), px(0.))).child(
+                div()
+                    .id("dropdown-backdrop")
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .occlude()
+                    .on_any_mouse_down(close),
+            ),
+        )
+        .with_priority(1)
+        .into_any_element(),
+        // `anchored` takes its own layout origin as the anchor point, so pin a
+        // zero-size box to the parent's bottom-right corner and anchor there.
+        div()
+            .absolute()
+            .right(px(0.))
+            .bottom(px(0.))
+            .w(px(0.))
+            .h(px(0.))
+            .child(
+                deferred(
+                    anchored()
+                        .anchor(Corner::TopRight)
+                        .offset(point(px(0.), px(4.)))
+                        .child(
+                            items
+                                .occlude()
+                                .flex()
+                                .flex_col()
+                                .p_1()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .bg(rgb(HEADER))
+                                .shadow_lg()
+                                .text_xs(),
+                        ),
+                )
+                .with_priority(2),
+            )
+            .into_any_element(),
+    ]
+}
+
 impl GitTrack {
+    fn toggle_menu(&mut self, menu: OpenMenu, cx: &mut Context<Self>) {
+        self.menu = if self.menu.as_ref() == Some(&menu) {
+            None
+        } else {
+            Some(menu)
+        };
+        cx.notify();
+    }
+
+    fn close_menu(&mut self, cx: &mut Context<Self>) {
+        self.menu = None;
+        cx.notify();
+    }
+
     /// "Menu ▾" button with a small dropdown.
     fn render_menu(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let item = |id: &'static str, label: &'static str, shortcut: Option<&'static str>| {
-            div()
-                .id(id)
-                .flex()
-                .flex_row()
-                .gap_6()
-                .px_3()
-                .py_1()
-                .rounded_sm()
-                .whitespace_nowrap()
-                .cursor_pointer()
-                .hover(|s| s.bg(rgb(BUTTON_HOVER)))
-                .child(div().flex_1().child(label))
-                .children(shortcut.map(|s| div().text_color(rgb(DIM)).child(s)))
-        };
-        let close = |this: &mut Self, cx: &mut Context<Self>| {
-            this.menu_open = false;
-            cx.notify();
-        };
-
+        let open = self.menu == Some(OpenMenu::Main);
         div()
             .relative()
             .child(
-                button("menu", "Menu ▾").on_click(cx.listener(|this, _, _, cx| {
-                    this.menu_open = !this.menu_open;
-                    cx.notify();
-                })),
+                button("menu", "Menu ▾")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(OpenMenu::Main, cx))),
             )
-            .when(self.menu_open, |d| {
-                d.child(
-                    // Transparent full-window backdrop: a click anywhere else closes the menu.
-                    deferred(
-                        anchored().position(point(px(0.), px(0.))).child(
-                            div()
-                                .id("config-menu-backdrop")
-                                .w(window.viewport_size().width)
-                                .h(window.viewport_size().height)
-                                .occlude()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| close(this, cx)),
-                                )
-                                .on_mouse_down(
-                                    MouseButton::Right,
-                                    cx.listener(move |this, _, _, cx| close(this, cx)),
-                                ),
-                        ),
-                    )
-                    .with_priority(1),
-                )
-                .child(
-                    // `anchored` takes its own layout origin as the anchor point, so pin a
-                    // zero-size box to the button's bottom-right corner and anchor there.
+            .when(open, |d| {
+                d.children(dropdown(
+                    window,
+                    cx.listener(|this, _, _, cx| this.close_menu(cx)),
                     div()
-                        .absolute()
-                        .right(px(0.))
-                        .bottom(px(0.))
-                        .w(px(0.))
-                        .h(px(0.))
+                        .child(menu_label(Config::path().display().to_string()))
                         .child(
-                            deferred(
-                                anchored()
-                                    .anchor(Corner::TopRight)
-                                    .offset(point(px(0.), px(4.)))
-                                    .child(
-                                        div()
-                                            .occlude()
-                                            .flex()
-                                            .flex_col()
-                                            .p_1()
-                                            .rounded_md()
-                                            .border_1()
-                                            .border_color(rgb(BORDER))
-                                            .bg(rgb(HEADER))
-                                            .shadow_lg()
-                                            .text_xs()
-                                            .child(
-                                                div()
-                                                    .px_3()
-                                                    .py_1()
-                                                    .whitespace_nowrap()
-                                                    .text_color(rgb(DIM))
-                                                    .child(Config::path().display().to_string()),
-                                            )
-                                            .child(
-                                                item(
-                                                    "config-open",
-                                                    "Open config in default editor",
-                                                    None,
-                                                )
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    cx.open_with_system(&Config::path());
-                                                    close(this, cx);
-                                                })),
-                                            )
-                                            .child(
-                                                item(
-                                                    "config-reveal",
-                                                    "Show config in Explorer",
-                                                    None,
-                                                )
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    cx.reveal_path(&Config::path());
-                                                    close(this, cx);
-                                                })),
-                                            )
-                                            .child(div().my_1().h(px(1.)).bg(rgb(BORDER)))
-                                            .child(
-                                                item("quit", "Quit git-track", Some("Ctrl+Q"))
-                                                    .on_click(
-                                                        cx.listener(|this, _, _, cx| this.quit(cx)),
-                                                    ),
-                                            ),
-                                    ),
-                            )
-                            .with_priority(2),
+                            menu_item("config-open", "Open config in default editor", None)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.open_with_system(&Config::path());
+                                    this.close_menu(cx);
+                                })),
+                        )
+                        .child(
+                            menu_item("config-reveal", "Show config in Explorer", None).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    cx.reveal_path(&Config::path());
+                                    this.close_menu(cx);
+                                }),
+                            ),
+                        )
+                        .child(menu_separator())
+                        .child(
+                            menu_item("quit", "Quit git-track", Some("Ctrl+Q"))
+                                .on_click(cx.listener(|this, _, _, cx| this.quit(cx))),
+                        ),
+                ))
+            })
+    }
+
+    /// IDE button for a repository inside a JetBrains project: opens the
+    /// project in the detected IDE, or offers the installed IDEs.
+    fn render_ide_button(
+        &self,
+        kind: SourceKind,
+        repo: &RepoStatus,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.config.jetbrains.enabled {
+            return None;
+        }
+        let project = repo.idea.clone()?;
+        let distro = self.distro(kind);
+        let repo_path = repo.path.clone();
+        let button_id = id(format_args!("{kind:?}:{}:ide", repo.path));
+
+        if let Some(ide) = self.jetbrains.detect(kind, &project, distro.as_deref()) {
+            let code = ide.code.clone();
+            return Some(
+                button(button_id, ide.name.clone())
+                    .tooltip(tooltip(format!("Open {project} in {}", ide.name)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_ide(&code, kind, &project, repo_path.clone(), cx)
+                    }))
+                    .into_any_element(),
+            );
+        }
+
+        let ides = self.jetbrains.ides();
+        if ides.is_empty() {
+            return None;
+        }
+        let menu = OpenMenu::Ide(kind, repo.path.clone());
+        let open = self.menu.as_ref() == Some(&menu);
+        let items = ides.iter().fold(
+            div().child(menu_label(format!("Open {project} in"))),
+            |items, ide| {
+                let (code, project, repo_path) =
+                    (ide.code.clone(), project.clone(), repo_path.clone());
+                items.child(
+                    menu_item(
+                        id(format_args!("{kind:?}:{}:ide:{code}", repo.path)),
+                        ide.name.clone(),
+                        None,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_menu(cx);
+                        this.open_ide(&code, kind, &project, repo_path.clone(), cx)
+                    })),
+                )
+            },
+        );
+        Some(
+            div()
+                .relative()
+                .child(
+                    button(button_id, "IDE ▾")
+                        .tooltip(tooltip(format!(
+                            "JetBrains project {project}\n(IDE unknown: not in any recent projects list)"
+                        )))
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.toggle_menu(menu.clone(), cx)),
                         ),
                 )
-            })
+                .when(open, |d| {
+                    d.children(dropdown(
+                        window,
+                        cx.listener(|this, _, _, cx| this.close_menu(cx)),
+                        items,
+                    ))
+                })
+                .into_any_element(),
+        )
     }
 
     fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -780,7 +911,12 @@ impl GitTrack {
             )
     }
 
-    fn render_source(&self, source: &Source, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_source(
+        &self,
+        source: &Source,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let kind = source.kind;
         let status = match source.phase {
             Phase::Scanning {
@@ -853,7 +989,7 @@ impl GitTrack {
             })
             .children(
                 rows.into_iter()
-                    .map(|repo| self.render_repo(kind, repo, cx)),
+                    .map(|repo| self.render_repo(kind, repo, window, cx)),
             )
     }
 
@@ -861,8 +997,10 @@ impl GitTrack {
         &self,
         kind: SourceKind,
         repo: &RepoStatus,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        let ide_button = self.render_ide_button(kind, repo, window, cx);
         let path = repo.path.clone();
         let busy = self.busy.contains(&(kind, path.clone()));
         let accent = if repo.error.is_some()
@@ -995,6 +1133,7 @@ impl GitTrack {
                     .flex_row()
                     .flex_shrink_0()
                     .gap_1()
+                    .children(ide_button)
                     .children(action_buttons)
                     .child(
                         button(
@@ -1016,7 +1155,7 @@ impl Render for GitTrack {
             .sources
             .iter()
             .filter(|s| self.config.enabled(s.kind))
-            .map(|s| self.render_source(s, cx).into_any_element())
+            .map(|s| self.render_source(s, window, cx).into_any_element())
             .collect();
 
         div()
@@ -1029,8 +1168,8 @@ impl Render for GitTrack {
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &Quit, _, cx| this.quit(cx)))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" && this.menu_open {
-                    this.menu_open = false;
+                if event.keystroke.key == "escape" && this.menu.is_some() {
+                    this.menu = None;
                     cx.notify();
                 }
             }))
