@@ -102,6 +102,11 @@ default editor* / *Show config in Explorer*). It is re-read on every full refres
   was in front, otherwise shows it), right click opens a menu with *Quit*. Quit fully with "Menu ▾" → *Quit git-track* or Ctrl+Q.
   Set `close_to_tray = false` to get a normal window without tray icon (restart
   required).
+* **Start with Windows**: "Menu ▾" → *Start with Windows* toggles an entry
+  under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` for this
+  executable. Started that way (`--autostart`), git-track stays hidden in the
+  tray until you open it. If the entry points to another copy, the item is
+  unchecked and its tooltip names that copy; enabling it switches the entry.
 * **Single instance**: starting git-track again just brings the running instance
   to the front. This is per executable path, so a debug and a release build can
   run side by side.

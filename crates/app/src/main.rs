@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod actions;
+mod autostart;
 mod config;
 mod instance;
 mod jetbrains;
@@ -241,6 +242,8 @@ struct GitTrack {
     deactivated_at: Option<Instant>,
     /// Decided when the tray icon is pressed: the click hides the window.
     tray_click_hides: bool,
+    /// Opened hidden (autostart) and not shown since.
+    never_shown: bool,
     focus: FocusHandle,
     /// Present while closing the window hides it to the tray.
     tray: Option<tray::Tray>,
@@ -254,6 +257,7 @@ impl GitTrack {
         window: &mut Window,
         cx: &mut Context<Self>,
         instance_commands: UnboundedReceiver<tray::Command>,
+        hidden: bool,
     ) -> Self {
         let (config, config_error) = match Config::load() {
             Ok(config) => (config, None),
@@ -281,7 +285,7 @@ impl GitTrack {
         let commands_task = cx.spawn_in(window, async move |this, cx| {
             while let Some(command) = commands.next().await {
                 let alive = this.update_in(cx, |this, window, cx| match command {
-                    tray::Command::Show => tray::show_window(window),
+                    tray::Command::Show => this.show_window(window, cx),
                     tray::Command::Press => {
                         // Pressing the tray icon already takes the focus away from
                         // the window, so "was in front" means: active until just now.
@@ -295,7 +299,7 @@ impl GitTrack {
                         if std::mem::take(&mut this.tray_click_hides) {
                             this.hide_to_tray(window, cx);
                         } else {
-                            tray::show_window(window);
+                            this.show_window(window, cx);
                         }
                     }
                     tray::Command::Quit => this.quit(cx),
@@ -364,14 +368,45 @@ impl GitTrack {
             last_wsl_sweep: None,
             deactivated_at: None,
             tray_click_hides: false,
+            never_shown: hidden,
             focus,
             tray,
             _commands_task: commands_task,
             _ticker: ticker,
             _activation: activation,
         };
+        if hidden && this.tray.is_none() {
+            // Nothing to bring the window back with: show it after all.
+            cx.spawn_in(window, async move |this, cx| {
+                let _ = this.update_in(cx, |this, window, cx| this.show_window(window, cx));
+            })
+            .detach();
+        }
         this.start_all(cx);
         this
+    }
+
+    /// Shows the window (from the tray or a hidden start) and brings it to the front.
+    fn show_window(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.never_shown) {
+            tray::show_window(window);
+            return;
+        }
+        // A window opened hidden gets its size and position from gpui on
+        // the first activation (done in a task); show and focus it after that.
+        window.activate_window();
+        cx.spawn_in(window, async move |_, cx| {
+            let _ = cx.update(|window, _| tray::show_window(window));
+        })
+        .detach();
+    }
+
+    fn toggle_autostart(&mut self, cx: &mut Context<Self>) {
+        let enable = autostart::state() != autostart::State::On;
+        if let Err(e) = autostart::set(enable) {
+            self.notice = Some(e);
+        }
+        cx.notify();
     }
 
     /// Hides the window if there is a tray icon to bring it back. Returns
@@ -767,24 +802,44 @@ fn dim(color: u32) -> Hsla {
     c
 }
 
-fn menu_item(
-    id: impl Into<ElementId>,
-    label: impl Into<SharedString>,
-    shortcut: Option<&'static str>,
-) -> Stateful<Div> {
+fn menu_row(id: impl Into<ElementId>) -> Stateful<Div> {
     div()
         .id(id)
         .flex()
         .flex_row()
-        .gap_6()
         .px_3()
         .py_1()
         .rounded_sm()
         .whitespace_nowrap()
         .cursor_pointer()
         .hover(|s| s.bg(rgb(BUTTON_HOVER)))
+}
+
+fn menu_item(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    shortcut: Option<&'static str>,
+) -> Stateful<Div> {
+    menu_row(id)
+        .gap_6()
         .child(div().flex_1().child(label.into()))
         .children(shortcut.map(|s| div().text_color(rgb(DIM)).child(s)))
+}
+
+/// A menu entry with a check mark in front.
+fn menu_check(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    checked: bool,
+) -> Stateful<Div> {
+    menu_row(id)
+        .child(
+            div()
+                .w_5()
+                .flex_none()
+                .child(if checked { "✓" } else { "" }),
+        )
+        .child(label.into())
 }
 
 fn menu_label(text: impl Into<SharedString>) -> Div {
@@ -873,6 +928,16 @@ impl GitTrack {
     /// "Menu ▾" button with a small dropdown.
     fn render_menu(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let open = self.menu == Some(OpenMenu::Main);
+        // Read while the menu is open, so changes made elsewhere show up.
+        let autostart = if open {
+            autostart::state()
+        } else {
+            autostart::State::Off
+        };
+        let other_autostart = match &autostart {
+            autostart::State::Other(path) => Some(path.clone()),
+            _ => None,
+        };
         div()
             .relative()
             .child(
@@ -899,6 +964,20 @@ impl GitTrack {
                                     this.close_menu(cx);
                                 }),
                             ),
+                        )
+                        .child(menu_separator())
+                        .child(
+                            menu_check(
+                                "autostart",
+                                "Start with Windows",
+                                autostart == autostart::State::On,
+                            )
+                            .when_some(other_autostart, |item, other| {
+                                item.tooltip(tooltip(format!(
+                                    "Currently starts {other}; enabling switches to this copy"
+                                )))
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_autostart(cx))),
                         )
                         .child(menu_separator())
                         .child(
@@ -1367,13 +1446,15 @@ impl Render for GitTrack {
 }
 
 fn main() {
+    // Started at login: stay in the tray (shown anyway if there is no tray icon).
+    let hidden = autostart::launched();
     let instance_commands = match instance::acquire() {
         instance::Instance::Primary(commands) => commands,
         // The running instance shows its window instead.
         instance::Instance::Secondary => return,
     };
 
-    Application::new().run(|cx: &mut App| {
+    Application::new().run(move |cx: &mut App| {
         cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
@@ -1391,11 +1472,14 @@ fn main() {
                     ..Default::default()
                 }),
                 window_min_size: Some(size(px(640.), px(320.))),
+                show: !hidden,
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| GitTrack::new(window, cx, instance_commands)),
+            |window, cx| cx.new(|cx| GitTrack::new(window, cx, instance_commands, hidden)),
         )
         .expect("failed to open window");
-        cx.activate(true);
+        if !hidden {
+            cx.activate(true);
+        }
     });
 }
