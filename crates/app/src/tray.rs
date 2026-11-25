@@ -24,6 +24,7 @@ mod imp {
     use futures::channel::mpsc::{UnboundedReceiver, unbounded};
     use gpui::Window;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use std::sync::Arc;
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{
         Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
@@ -68,14 +69,14 @@ mod imp {
                     });
                 }
             }));
-            MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-                let command = match event.id.as_ref() {
+            MenuEvent::set_event_handler(Some(Arc::new(move |event: MenuEvent| {
+                let command = match event.id().as_ref() {
                     SHOW_ID => Command::Show,
                     QUIT_ID => Command::Quit,
                     _ => return,
                 };
                 let _ = tx.unbounded_send(command);
-            }));
+            })));
 
             let menu = Menu::new();
             menu.append_items(&[
