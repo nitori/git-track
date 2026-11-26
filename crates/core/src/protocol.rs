@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 pub fn default_exclude_dirs() -> Vec<String> {
     [
@@ -133,9 +133,8 @@ impl TrackOptions {
         "in_progress",
     ];
 
-    /// Sets a toggle by its name (as used in the config file).
-    pub fn set(&mut self, name: &str, value: bool) -> Result<(), String> {
-        let field = match name {
+    fn field_mut(&mut self, name: &str) -> Option<&mut bool> {
+        Some(match name {
             "staged" => &mut self.staged,
             "modified" => &mut self.modified,
             "untracked" => &mut self.untracked,
@@ -148,13 +147,23 @@ impl TrackOptions {
             "no_remote" => &mut self.no_remote,
             "stash" => &mut self.stash,
             "in_progress" => &mut self.in_progress,
-            _ => {
-                return Err(format!(
-                    "unknown issue kind '{name}' (valid: {})",
-                    Self::NAMES.join(", ")
-                ));
-            }
-        };
+            _ => return None,
+        })
+    }
+
+    /// Reads a toggle by its name (as used in the config file).
+    pub fn get(&self, name: &str) -> Option<bool> {
+        self.clone().field_mut(name).map(|v| *v)
+    }
+
+    /// Sets a toggle by its name (as used in the config file).
+    pub fn set(&mut self, name: &str, value: bool) -> Result<(), String> {
+        let field = self.field_mut(name).ok_or_else(|| {
+            format!(
+                "unknown issue kind '{name}' (valid: {})",
+                Self::NAMES.join(", ")
+            )
+        })?;
         *field = value;
         Ok(())
     }
@@ -171,6 +180,9 @@ pub struct ScanRequest {
     /// Only check `repos`; `roots` then just tell which root a repository
     /// belongs to (used for re-checks).
     pub skip_discovery: bool,
+    /// Ignored paths: repositories at or below them are neither discovered
+    /// nor checked. A leading `~` is expanded to the home directory.
+    pub ignore: Vec<String>,
     pub options: ScanOptions,
 }
 

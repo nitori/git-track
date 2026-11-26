@@ -7,6 +7,8 @@ mod instance;
 mod jetbrains;
 mod scanner;
 mod scrollbar;
+mod settings;
+mod text_input;
 mod tray;
 
 use std::collections::{BTreeMap, HashSet};
@@ -18,7 +20,7 @@ use futures::channel::mpsc::UnboundedReceiver;
 use git_track_core::{Event, PROTOCOL_VERSION, RepoStatus, Severity};
 use gpui::{
     AnyElement, AnyView, App, Application, Bounds, ClipboardItem, Context, Corner, Div, ElementId,
-    FocusHandle, FontWeight, Hsla, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
+    Entity, FocusHandle, FontWeight, Hsla, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
     SharedString, Stateful, Subscription, Task, TitlebarOptions, Window, WindowBounds,
     WindowOptions, actions, anchored, deferred, div, point, prelude::*, px, rgb, size,
 };
@@ -26,7 +28,7 @@ use gpui::{
 use config::Config;
 use scanner::{Msg, SourceKind};
 
-actions!(git_track, [Quit]);
+actions!(git_track, [Quit, OpenSettings]);
 
 mod colors {
     pub const BG: u32 = 0x1e1f22;
@@ -217,6 +219,8 @@ enum OpenMenu {
     Main,
     /// IDE chooser of a repository.
     Ide(SourceKind, String),
+    /// "Ignore" choices of a repository.
+    Ignore(SourceKind, String),
 }
 
 struct GitTrack {
@@ -247,6 +251,8 @@ struct GitTrack {
     focus: FocusHandle,
     /// Present while closing the window hides it to the tray.
     tray: Option<tray::Tray>,
+    /// The open settings dialog.
+    settings: Option<(Entity<settings::Settings>, Subscription)>,
     _commands_task: Task<()>,
     _ticker: Task<()>,
     _activation: Subscription,
@@ -371,6 +377,7 @@ impl GitTrack {
             never_shown: hidden,
             focus,
             tray,
+            settings: None,
             _commands_task: commands_task,
             _ticker: ticker,
             _activation: activation,
@@ -399,6 +406,105 @@ impl GitTrack {
             let _ = cx.update(|window, _| tray::show_window(window));
         })
         .detach();
+    }
+
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            return;
+        }
+        self.menu = None;
+        // Start from the file, so edits made there since the last refresh are kept.
+        let (draft, load_error) = match Config::load() {
+            Ok(config) => (config, None),
+            Err(e) => (self.config.clone(), Some(e)),
+        };
+        let view = cx.new(|cx| settings::Settings::new(draft, load_error, cx));
+        let subscription = cx.subscribe_in(&view, window, |this, _, event, window, cx| {
+            if let settings::SettingsEvent::Saved = event {
+                this.apply_settings(cx);
+            }
+            this.close_settings(window, cx);
+        });
+        self.settings = Some((view, subscription));
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings = None;
+        // The focused input is gone; keep keyboard shortcuts working.
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    /// Takes over the config the settings dialog wrote.
+    fn apply_settings(&mut self, cx: &mut Context<Self>) {
+        let old = self.config.clone();
+        match Config::load() {
+            Ok(config) => {
+                self.config = config;
+                self.config_error = None;
+            }
+            Err(e) => {
+                self.config_error = Some(e);
+                return;
+            }
+        }
+        if old.close_to_tray != self.config.close_to_tray {
+            self.notice = Some("The tray setting takes effect after restarting git-track.".into());
+        }
+        self.apply_ignores();
+        let new = &self.config;
+        let rescan = old.track != new.track
+            || old.jetbrains != new.jetbrains
+            || old.windows != new.windows
+            || old.wsl != new.wsl;
+        if rescan {
+            self.start_all(cx);
+        }
+        self.sync_tray();
+        cx.notify();
+    }
+
+    /// Adds `path` to the ignored paths of `kind` and saves the config.
+    fn ignore_path(&mut self, kind: SourceKind, path: String, cx: &mut Context<Self>) {
+        self.menu = None;
+        let mut config = match Config::load() {
+            Ok(config) => config,
+            Err(e) => {
+                self.notice = Some(format!("Cannot ignore {path}: {e}"));
+                cx.notify();
+                return;
+            }
+        };
+        if !config.is_ignored(kind, &path) {
+            config.ignored_mut(kind).push(path);
+        }
+        match config.save() {
+            Ok(()) => {
+                self.config = config;
+                self.config_error = None;
+                self.apply_ignores();
+                self.sync_tray();
+            }
+            Err(e) => self.notice = Some(e),
+        }
+        cx.notify();
+    }
+
+    /// Drops listed repositories that are ignored now.
+    fn apply_ignores(&mut self) {
+        for kind in SOURCES {
+            let ignored: Vec<String> = self
+                .source(kind)
+                .repos
+                .keys()
+                .filter(|path| self.config.is_ignored(kind, path))
+                .cloned()
+                .collect();
+            for path in ignored {
+                self.remove_repo(kind, &path);
+            }
+        }
     }
 
     fn toggle_autostart(&mut self, cx: &mut Context<Self>) {
@@ -949,6 +1055,10 @@ impl GitTrack {
                     window,
                     cx.listener(|this, _, _, cx| this.close_menu(cx)),
                     div()
+                        .child(menu_item("settings", "Settings…", Some("Ctrl+,")).on_click(
+                            cx.listener(|this, _, window, cx| this.open_settings(window, cx)),
+                        ))
+                        .child(menu_separator())
                         .child(menu_label(Config::path().display().to_string()))
                         .child(
                             menu_item("config-open", "Open config in default editor", None)
@@ -1064,6 +1174,66 @@ impl GitTrack {
         )
     }
 
+    /// "Ignore ▾": hides the repository or one of its parent folders (up to,
+    /// not including, the root) from now on.
+    fn render_ignore_button(
+        &self,
+        kind: SourceKind,
+        repo: &RepoStatus,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let menu = OpenMenu::Ignore(kind, repo.path.clone());
+        let open = self.menu.as_ref() == Some(&menu);
+        let element = div().relative().child(
+            button(
+                id(format_args!("{kind:?}:{}:ignore", repo.path)),
+                "Ignore ▾",
+            )
+            .text_color(rgb(DIM))
+            .tooltip(tooltip(
+                "Hide this repository (or a parent folder) from now on",
+            ))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_menu(menu.clone(), cx))),
+        );
+        if !open {
+            return element;
+        }
+
+        let windows = kind == SourceKind::Windows;
+        let parents: Vec<String> = match &repo.root {
+            Some(root) => Path::new(&repo.path)
+                .ancestors()
+                .skip(1)
+                .map(|p| p.to_string_lossy().into_owned())
+                .take_while(|p| {
+                    git_track_core::discover::path_within(p, root, windows)
+                        && !git_track_core::discover::path_within(root, p, windows)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let entry = |label: String, path: String, index: usize| {
+            menu_item(
+                id(format_args!("{kind:?}:{}:ignore{index}", repo.path)),
+                label,
+                None,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.ignore_path(kind, path.clone(), cx)))
+        };
+        let mut items = div()
+            .child(menu_label("Ignore from now on (undo in Settings)"))
+            .child(entry("This repository".into(), repo.path.clone(), 0));
+        for (i, parent) in parents.into_iter().enumerate() {
+            items = items.child(entry(format!("Folder {parent}"), parent, i + 1));
+        }
+        element.children(dropdown(
+            window,
+            cx.listener(|this, _, _, cx| this.close_menu(cx)),
+            items,
+        ))
+    }
+
     fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let Summary {
             total, scanning, ..
@@ -1140,7 +1310,9 @@ impl GitTrack {
             .values()
             .filter(|r| self.show_clean || !r.is_clean())
             .collect();
+        let no_roots = self.config.roots(kind).is_empty();
         let all_pushed = rows.is_empty()
+            && !no_roots
             && !source.scanning()
             && source.error.is_none()
             && source.last_scan.is_some();
@@ -1187,6 +1359,22 @@ impl GitTrack {
                     .chain(&source.warning)
                     .map(|e| div().text_color(rgb(DANGER)).text_xs().child(e.clone())),
             )
+            .when(no_roots, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .text_color(rgb(DIM))
+                        .child("No folders to scan yet.")
+                        .child(
+                            button(id(format_args!("settings-{kind:?}")), "Add folders…").on_click(
+                                cx.listener(|this, _, window, cx| this.open_settings(window, cx)),
+                            ),
+                        ),
+                )
+            })
             .when(all_pushed, |d| {
                 d.child(div().text_color(rgb(OK)).child(format!(
                     "All {} repositories are pushed.",
@@ -1341,6 +1529,7 @@ impl GitTrack {
                     .gap_1()
                     .children(ide_button)
                     .children(action_buttons)
+                    .child(self.render_ignore_button(kind, repo, window, cx))
                     .child(
                         button(
                             id(format_args!("{kind:?}:{path}:recheck")),
@@ -1365,6 +1554,7 @@ impl Render for GitTrack {
             .collect();
 
         div()
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -1373,8 +1563,16 @@ impl Render for GitTrack {
             .text_sm()
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &Quit, _, cx| this.quit(cx)))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" && this.menu.is_some() {
+            .on_action(
+                cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)),
+            )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key != "escape" {
+                    return;
+                }
+                if this.settings.is_some() {
+                    this.close_settings(window, cx);
+                } else if this.menu.is_some() {
                     this.menu = None;
                     cx.notify();
                 }
@@ -1442,6 +1640,7 @@ impl Render for GitTrack {
                         },
                     ))),
             )
+            .children(self.settings.as_ref().map(|(view, _)| view.clone()))
     }
 }
 
@@ -1455,7 +1654,11 @@ fn main() {
     };
 
     Application::new().run(move |cx: &mut App| {
-        cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
+        cx.bind_keys([
+            KeyBinding::new("ctrl-q", Quit, None),
+            KeyBinding::new("ctrl-,", OpenSettings, None),
+        ]);
+        text_input::bind_keys(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();

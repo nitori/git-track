@@ -34,7 +34,9 @@ config error). For the agent CLI use `--skip stash,untracked`.
 
 Every directory containing a `.git` directory **or file** is a repository, and
 the walk continues *inside* repositories, so nested repositories that are not
-submodules (and usually gitignored by their parent) are found as well.
+submodules (and usually gitignored by their parent) are found as well. Broken
+`.git` entries are skipped: a `.git` folder needs `HEAD` and an object store, a
+`.git` file must point (`gitdir: …`) to such a folder.
 `.gitignore` is deliberately not honoured. Symlinks/junctions are not followed.
 Directory names in `scan.exclude_dirs` (default: `node_modules`, caches, venvs)
 are skipped.
@@ -69,8 +71,17 @@ crates/app     git-track: the GPUI app (Windows)
    from the default members so building in WSL does not pull in GPUI.)
 
 On first start a fully commented config with all defaults is created at
-`%APPDATA%\git-track\config.toml` — just edit it ("Menu ▾" → *Open config in
-default editor* / *Show config in Explorer*). It is re-read on every full refresh.
+`%APPDATA%\git-track\config.toml`. No Windows folders are scanned until you add
+some (WSL starts with `~/projects`).
+
+**Settings** ("Menu ▾" → *Settings…* or Ctrl+,) edits the common options: the
+folders to scan and ignored paths per side (type a path or *Browse…*; for WSL
+pick a folder below `\\wsl.localhost\<distro>`), the WSL distribution, the
+reported issue kinds, the rescan interval, tray, autostart and the JetBrains
+button. Saving writes them into the config file and keeps its comments and
+everything else. Actions, excluded folder names, branches and depth are edited
+in the file itself ("Menu ▾" → *Open config in default editor*); it is re-read
+on every full refresh.
 
 ## Using the app
 
@@ -94,6 +105,9 @@ default editor* / *Show config in Explorer*). It is re-read on every full refres
   when the window is activated; WSL repositories are re-checked by the agent on
   activation (at most once a minute). A re-check (↻) of a deleted repository
   removes it, too.
+* **Ignore ▾** on a repository hides it, or one of its parent folders (below the
+  scan root), from now on: ignored paths are skipped during discovery. Undo it
+  in Settings (or `ignore = [...]` under `[windows]` / `[wsl]`).
 * Click a repository name to copy its path; hover issues for details.
 * **Show clean** also lists repositories without problems.
 * **System tray**: closing the window only hides it; the app keeps scanning in

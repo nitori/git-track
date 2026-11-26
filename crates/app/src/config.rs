@@ -1,11 +1,15 @@
 //! User configuration, stored as TOML in `%APPDATA%\git-track\config.toml`.
 //!
 //! The file is re-read on every full refresh, so edits apply without a restart.
+//! The settings window writes its values back with `toml_edit`, which keeps
+//! the comments and everything it does not manage.
 
 use std::path::PathBuf;
 
+use git_track_core::discover::path_within;
 use git_track_core::{ScanOptions, ScanRequest, TrackOptions};
 use serde::{Deserialize, Serialize};
+use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
 
 use crate::scanner::SourceKind;
 
@@ -55,14 +59,20 @@ enabled = true
 
 [windows]
 enabled = true
-roots = ['D:\Sources\Lichtflut']
+# Folders that are searched for repositories, e.g. ['C:\Users\me\projects', 'D:\code']
+roots = []
+# Repositories and folders to skip (everything at or below these paths).
+ignore = []
 # git = 'C:\Program Files\Git\cmd\git.exe'
 
 [wsl]
 enabled = true
 # Distribution to use; the default distribution if not set.
 # distro = "Debian"
+# Folders that are searched for repositories ("~/" is the WSL home directory).
 roots = ["~/projects"]
+# Repositories and folders to skip (everything at or below these paths).
+ignore = []
 # git-track-agent inside WSL. A leading "~/" means the WSL home directory.
 # Install it from a WSL shell with: cargo install --path crates/agent
 agent = "~/.cargo/bin/git-track-agent"
@@ -131,6 +141,7 @@ impl Default for JetBrainsConfig {
 pub struct WindowsConfig {
     pub enabled: bool,
     pub roots: Vec<String>,
+    pub ignore: Vec<String>,
     pub git: Option<String>,
 }
 
@@ -140,6 +151,7 @@ pub struct WslConfig {
     pub enabled: bool,
     pub distro: Option<String>,
     pub roots: Vec<String>,
+    pub ignore: Vec<String>,
     pub agent: String,
     pub git: Option<String>,
 }
@@ -189,7 +201,8 @@ impl Default for WindowsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            roots: vec![r"D:\Sources\Lichtflut".into()],
+            roots: Vec::new(),
+            ignore: Vec::new(),
             git: None,
         }
     }
@@ -201,6 +214,7 @@ impl Default for WslConfig {
             enabled: true,
             distro: None,
             roots: vec!["~/projects".into()],
+            ignore: Vec::new(),
             agent: "~/.cargo/bin/git-track-agent".into(),
             git: None,
         }
@@ -246,6 +260,87 @@ impl Config {
         }
     }
 
+    pub fn ignored(&self, kind: SourceKind) -> &[String] {
+        match kind {
+            SourceKind::Windows => &self.windows.ignore,
+            SourceKind::Wsl => &self.wsl.ignore,
+        }
+    }
+
+    pub fn ignored_mut(&mut self, kind: SourceKind) -> &mut Vec<String> {
+        match kind {
+            SourceKind::Windows => &mut self.windows.ignore,
+            SourceKind::Wsl => &mut self.wsl.ignore,
+        }
+    }
+
+    /// True if `path` (native to `kind`) is at or below an ignored path.
+    pub fn is_ignored(&self, kind: SourceKind, path: &str) -> bool {
+        let windows = kind == SourceKind::Windows;
+        self.ignored(kind)
+            .iter()
+            .any(|prefix| path_within(path, &expand_home(kind, prefix), windows))
+    }
+
+    /// Writes the values the settings window manages into the config file,
+    /// keeping comments and all other entries as they are.
+    pub fn save(&self) -> Result<(), String> {
+        let path = Self::path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => DEFAULT_CONFIG.to_string(),
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        };
+        let mut doc: DocumentMut = text
+            .parse()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        self.write_to(&mut doc)?;
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::write(&path, doc.to_string())
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))
+    }
+
+    fn write_to(&self, doc: &mut DocumentMut) -> Result<(), String> {
+        let root = doc.as_table_mut();
+        set(
+            root,
+            "refresh_interval_secs",
+            (self.refresh_interval_secs as i64).into(),
+        );
+        set(root, "close_to_tray", self.close_to_tray.into());
+
+        let track = table(root, "track")?;
+        for name in TrackOptions::NAMES {
+            let on = self.track.get(name).unwrap_or(true);
+            set(track, name, on.into());
+        }
+
+        set(
+            table(root, "jetbrains")?,
+            "enabled",
+            self.jetbrains.enabled.into(),
+        );
+
+        let windows = table(root, "windows")?;
+        set(windows, "enabled", self.windows.enabled.into());
+        set(windows, "roots", strings(&self.windows.roots));
+        set(windows, "ignore", strings(&self.windows.ignore));
+
+        let wsl = table(root, "wsl")?;
+        set(wsl, "enabled", self.wsl.enabled.into());
+        match &self.wsl.distro {
+            Some(distro) => set(wsl, "distro", distro.as_str().into()),
+            None => {
+                wsl.remove("distro");
+            }
+        }
+        set(wsl, "roots", strings(&self.wsl.roots));
+        set(wsl, "ignore", strings(&self.wsl.ignore));
+        Ok(())
+    }
+
     /// Request for a full scan (`repos` empty) or a re-check of specific repositories.
     pub fn request(&self, kind: SourceKind, repos: Vec<String>) -> ScanRequest {
         let mut options = self.scan.clone();
@@ -260,6 +355,7 @@ impl Config {
         }
         ScanRequest {
             roots: self.roots(kind).to_vec(),
+            ignore: self.ignored(kind).to_vec(),
             // Re-checks skip discovery; the roots only attribute the repository.
             skip_discovery: !repos.is_empty(),
             repos,
@@ -272,9 +368,109 @@ impl Config {
     }
 }
 
+/// Replaces a value but keeps its formatting (e.g. a trailing comment).
+fn set(table: &mut dyn TableLike, key: &str, value: Value) {
+    match table.get_mut(key) {
+        Some(Item::Value(old)) => {
+            let mut decor = old.decor().clone();
+            // Keep aligned trailing comments aligned: adjust the whitespace
+            // between value and comment by the change in length.
+            let len = |v: &Value| {
+                let mut bare = v.clone();
+                bare.decor_mut().clear();
+                bare.to_string().chars().count()
+            };
+            let (old_len, new_len) = (len(old), len(&value));
+            let suffix = decor.suffix().and_then(|s| s.as_str()).map(str::to_owned);
+            if let Some(suffix) = suffix {
+                let spaces = suffix.len() - suffix.trim_start_matches(' ').len();
+                if spaces > 0 && suffix[spaces..].starts_with('#') {
+                    let spaces = (spaces + old_len).saturating_sub(new_len).max(1);
+                    decor.set_suffix(format!(
+                        "{}{}",
+                        " ".repeat(spaces),
+                        suffix.trim_start_matches(' ')
+                    ));
+                }
+            }
+            *old = value;
+            *old.decor_mut() = decor;
+        }
+        _ => {
+            table.insert(key, Item::Value(value));
+        }
+    }
+}
+
+fn table<'a>(root: &'a mut toml_edit::Table, name: &str) -> Result<&'a mut dyn TableLike, String> {
+    root.entry(name)
+        .or_insert(toml_edit::table())
+        .as_table_like_mut()
+        .ok_or_else(|| format!("'{name}' in the config file is not a table"))
+}
+
+fn strings(items: &[String]) -> Value {
+    Value::Array(items.iter().map(String::as_str).collect::<Array>())
+}
+
+/// Expands `~` in Windows paths. WSL paths stay as they are: only the agent
+/// knows the WSL home directory (it expands them when scanning).
+fn expand_home(kind: SourceKind, path: &str) -> String {
+    match kind {
+        SourceKind::Windows => git_track_core::discover::expand_tilde(path)
+            .to_string_lossy()
+            .into_owned(),
+        SourceKind::Wsl => path.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_keeps_comments_and_round_trips() {
+        let mut config = Config {
+            refresh_interval_secs: 120,
+            ..Default::default()
+        };
+        config.track.stash = false;
+        config.windows.roots = vec![r"C:\Users\me\code".into()];
+        config.windows.ignore = vec![r"C:\Users\me\code\old".into()];
+        config.wsl.distro = Some("Debian".into());
+        config.jetbrains.enabled = false;
+
+        let mut doc: DocumentMut = DEFAULT_CONFIG.parse().unwrap();
+        config.write_to(&mut doc).unwrap();
+        let text = doc.to_string();
+
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), config);
+        // Comments survive, Windows paths stay readable.
+        assert!(
+            text.contains("stash = false           # stash entries"),
+            "{text}"
+        );
+        assert!(text.contains("# Buttons shown next to each repository."));
+        assert!(text.contains(r"'C:\Users\me\code'"), "{text}");
+
+        // Clearing the distro removes the key again.
+        config.wsl.distro = None;
+        config.write_to(&mut doc).unwrap();
+        assert_eq!(toml::from_str::<Config>(&doc.to_string()).unwrap(), config);
+    }
+
+    #[test]
+    fn ignored_paths() {
+        let mut config = Config::default();
+        config.windows.ignore = vec![r"D:\Code\old".into()];
+        config.wsl.ignore = vec!["/home/me/projects/tmp".into()];
+        assert!(config.is_ignored(SourceKind::Windows, r"d:\code\old\repo"));
+        assert!(!config.is_ignored(SourceKind::Windows, r"D:\Code\older"));
+        assert!(config.is_ignored(SourceKind::Wsl, "/home/me/projects/tmp"));
+        assert!(!config.is_ignored(SourceKind::Wsl, "/home/me/projects/tmp2"));
+        let request = config.request(SourceKind::Wsl, Vec::new());
+        assert_eq!(request.ignore, ["/home/me/projects/tmp"]);
+    }
 
     #[test]
     fn default_template_matches_default() {

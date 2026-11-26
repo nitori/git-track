@@ -242,8 +242,8 @@ mod tests {
     #[test]
     fn project_keys_match_recent_project_paths() {
         assert_eq!(
-            project_key(SourceKind::Windows, r"D:\Sources\Lichtflut\Foo\", None).unwrap(),
-            normalize("D:/Sources/Lichtflut/Foo")
+            project_key(SourceKind::Windows, r"D:\Projects\Foo\", None).unwrap(),
+            normalize("D:/Projects/Foo")
         );
         let wsl = project_key(SourceKind::Wsl, "/home/me/projects/x", Some("Debian")).unwrap();
         assert_eq!(wsl, normalize("//wsl$/Debian/home/me/projects/x"));

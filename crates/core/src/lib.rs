@@ -43,6 +43,11 @@ pub fn scan(request: &ScanRequest, emit: &(dyn Fn(Event) + Sync)) {
     pool.install(|| {
         // (repo, root it was found under)
         let mut targets: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+        let ignore: Vec<PathBuf> = request
+            .ignore
+            .iter()
+            .map(|p| discover::expand_tilde(p))
+            .collect();
         let discover_roots = if request.skip_discovery {
             &[][..]
         } else {
@@ -50,7 +55,7 @@ pub fn scan(request: &ScanRequest, emit: &(dyn Fn(Event) + Sync)) {
         };
         for root in discover_roots {
             let root_path = discover::expand_tilde(root);
-            match discover::discover(&root_path, options) {
+            match discover::discover(&root_path, options, &ignore) {
                 Ok(repos) => {
                     targets.extend(repos.into_iter().map(|r| (r, Some(root_path.clone()))))
                 }
@@ -62,6 +67,9 @@ pub fn scan(request: &ScanRequest, emit: &(dyn Fn(Event) + Sync)) {
         }
         for repo in &request.repos {
             let path = discover::expand_tilde(repo);
+            if discover::is_ignored(&path, &ignore) {
+                continue;
+            }
             if discover::is_gone(&path) {
                 emit(Event::Gone {
                     path: path.to_string_lossy().into_owned(),
