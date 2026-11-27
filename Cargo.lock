@@ -2033,7 +2033,7 @@ dependencies = [
 
 [[package]]
 name = "git-track"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs 7.0.0",
  "embed-resource",
@@ -2050,12 +2050,11 @@ dependencies = [
  "tray-icon",
  "unicode-segmentation",
  "windows-sys 0.61.2",
- "zed-reqwest",
 ]
 
 [[package]]
 name = "git-track-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "git-track-core",
  "serde_json",
@@ -2063,7 +2062,7 @@ dependencies = [
 
 [[package]]
 name = "git-track-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rayon",
  "serde",
@@ -7095,7 +7094,6 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
- "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

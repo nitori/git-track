@@ -144,8 +144,9 @@ on every full refresh.
   run side by side.
 * **Updates**: 30 s after the start and then every 12 hours, git-track asks the
   GitHub API for the latest release (`check_updates = true`; release builds
-  only; "Menu ▾" → *Check for updates* works always). A newer version shows a
-  banner. *Install and restart* downloads `git-track.exe` and verifies its
+  only; "Menu ▾" → *Check for updates* works always). Requests go through
+  Windows' own HTTP client (WinHTTP), so the system proxy settings apply. A
+  newer version shows a banner. *Install and restart* downloads `git-track.exe` and verifies its
   SHA-256 against the digest GitHub lists for it. It then swaps it with the
   running executable (the old one becomes `git-track.exe.old`, deleted on the
   next start) and restarts. The executable path stays the same, so autostart

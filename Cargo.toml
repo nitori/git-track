@@ -4,7 +4,7 @@ members = ["crates/core", "crates/agent", "crates/app"]
 default-members = ["crates/core", "crates/agent"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 
@@ -23,6 +23,9 @@ futures = "0.3"
 [profile.dev.package."*"]
 opt-level = 2
 
+# Smallest binary at full speed; costs build time only. Not `panic = "abort"`:
+# a panic in a scan or watcher thread must not take the whole app down.
 [profile.release]
 strip = true
-lto = "thin"
+lto = "fat"
+codegen-units = 1

@@ -6,6 +6,9 @@
 //! Windows, just not overwritten) and starts the new one with
 //! `--updated <pid>`, which waits for this process to exit before it takes
 //! over (see [`after_start`]). The old file is deleted on the next start.
+//!
+//! HTTP goes through WinHTTP (part of Windows, uses its TLS and proxy
+//! settings) instead of a Rust HTTP/TLS stack, which would add ~3.5 MB.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -16,6 +19,8 @@ use sha2::{Digest, Sha256};
 const REPO: &str = "nitori/git-track";
 const ASSET: &str = "git-track.exe";
 const ARG: &str = "--updated";
+/// Per connect / send / receive step, not for the whole transfer.
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
@@ -45,31 +50,35 @@ struct ApiAsset {
     digest: Option<String>,
 }
 
-fn client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .user_agent(format!("git-track/{CURRENT}"))
-        .timeout(timeout)
-        .build()
-        .map_err(|e| format!("cannot create HTTP client: {e}"))
+/// `GET url` over HTTPS (redirects are followed); returns status and body.
+fn get(url: &str, accept: Option<&str>) -> Result<(u16, Vec<u8>), String> {
+    let (host, path) = split_url(url).ok_or_else(|| format!("unsupported URL {url}"))?;
+    imp::get(host, path, &format!("git-track/{CURRENT}"), accept)
+}
+
+/// `https://host/path?query` into host and path (with the query).
+fn split_url(url: &str) -> Option<(&str, &str)> {
+    let rest = url.strip_prefix("https://")?;
+    let (host, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, "/"),
+    };
+    (!host.is_empty() && !host.contains([':', '@'])).then_some((host, path))
 }
 
 /// The latest release if it is newer than this build. Blocking.
 pub fn check() -> Result<Option<Release>, String> {
-    let response = client(Duration::from_secs(30))?
-        .get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
-        .header("Accept", "application/vnd.github+json")
-        .send()
+    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    let (status, body) = get(&url, Some("application/vnd.github+json"))
         .map_err(|e| format!("cannot reach GitHub: {e}"))?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
+    match status {
+        200 => {}
         // No release published yet.
-        return Ok(None);
+        404 => return Ok(None),
+        _ => return Err(format!("update check failed: GitHub answered HTTP {status}")),
     }
-    let text = response
-        .error_for_status()
-        .and_then(|r| r.text())
-        .map_err(|e| format!("update check failed: {e}"))?;
     let release: ApiRelease =
-        serde_json::from_str(&text).map_err(|e| format!("unexpected answer from GitHub: {e}"))?;
+        serde_json::from_slice(&body).map_err(|e| format!("unexpected answer from GitHub: {e}"))?;
     let version = release.tag_name.trim_start_matches('v').to_string();
     if !is_newer(&version, CURRENT) {
         return Ok(None);
@@ -115,12 +124,11 @@ pub fn install(release: &Release) -> Result<(), String> {
     let new = sibling(&exe, ".new");
     let old = sibling(&exe, ".old");
 
-    let bytes = client(Duration::from_secs(300))?
-        .get(&release.download_url)
-        .send()
-        .and_then(|r| r.error_for_status())
-        .and_then(|r| r.bytes())
-        .map_err(|e| format!("download failed: {e}"))?;
+    let (status, bytes) =
+        get(&release.download_url, None).map_err(|e| format!("download failed: {e}"))?;
+    if status != 200 {
+        return Err(format!("download failed: HTTP {status}"));
+    }
     if bytes.len() < 1024 {
         return Err("download failed: the file is empty".into());
     }
@@ -193,11 +201,135 @@ pub fn after_start() -> bool {
 
 #[cfg(windows)]
 mod imp {
+    use std::ffi::c_void;
+    use std::ptr::{null, null_mut};
     use std::time::Duration;
-    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows_sys::Win32::Networking::WinHttp::*;
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
     };
+
+    /// A WinHTTP handle, closed on drop.
+    struct Handle(*mut c_void);
+
+    impl Handle {
+        fn new(handle: *mut c_void) -> Result<Self, String> {
+            if handle.is_null() {
+                Err(last_error())
+            } else {
+                Ok(Self(handle))
+            }
+        }
+    }
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            unsafe { WinHttpCloseHandle(self.0) };
+        }
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(Some(0)).collect()
+    }
+
+    fn last_error() -> String {
+        let code = unsafe { GetLastError() };
+        let what = match code {
+            ERROR_WINHTTP_TIMEOUT => "timed out",
+            ERROR_WINHTTP_NAME_NOT_RESOLVED => "server name not resolved (offline?)",
+            ERROR_WINHTTP_CANNOT_CONNECT => "cannot connect",
+            ERROR_WINHTTP_CONNECTION_ERROR => "connection reset",
+            ERROR_WINHTTP_SECURE_FAILURE => "TLS certificate error",
+            // Not WinHTTP's own range: the system knows the message.
+            _ if !(12000..13000).contains(&code) => {
+                return std::io::Error::from_raw_os_error(code as i32).to_string();
+            }
+            _ => "network error",
+        };
+        format!("{what} (WinHTTP error {code})")
+    }
+
+    pub fn get(
+        host: &str,
+        path: &str,
+        user_agent: &str,
+        accept: Option<&str>,
+    ) -> Result<(u16, Vec<u8>), String> {
+        let timeout = i32::try_from(super::TIMEOUT.as_millis()).unwrap_or(i32::MAX);
+        let headers = accept.map(|a| wide(&format!("Accept: {a}")));
+        unsafe {
+            // Automatic proxy: the system's proxy settings / auto-config.
+            let session = Handle::new(WinHttpOpen(
+                wide(user_agent).as_ptr(),
+                WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                null(),
+                null(),
+                0,
+            ))?;
+            if WinHttpSetTimeouts(session.0, timeout, timeout, timeout, timeout) == 0 {
+                return Err(last_error());
+            }
+            let connection = Handle::new(WinHttpConnect(
+                session.0,
+                wide(host).as_ptr(),
+                INTERNET_DEFAULT_HTTPS_PORT,
+                0,
+            ))?;
+            // Redirects (GitHub's downloads go to another host) are followed
+            // by default, except from HTTPS to HTTP.
+            let request = Handle::new(WinHttpOpenRequest(
+                connection.0,
+                wide("GET").as_ptr(),
+                wide(path).as_ptr(),
+                null(),
+                null(),
+                null(),
+                WINHTTP_FLAG_SECURE,
+            ))?;
+            let (headers, length) = match &headers {
+                Some(h) => (h.as_ptr(), u32::MAX), // null-terminated
+                None => (null(), 0),
+            };
+            if WinHttpSendRequest(request.0, headers, length, null(), 0, 0, 0) == 0
+                || WinHttpReceiveResponse(request.0, null_mut()) == 0
+            {
+                return Err(last_error());
+            }
+            let mut status = 0u32;
+            let mut size = size_of::<u32>() as u32;
+            if WinHttpQueryHeaders(
+                request.0,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                null(),
+                (&raw mut status).cast(),
+                &mut size,
+                null_mut(),
+            ) == 0
+            {
+                return Err(last_error());
+            }
+            let mut body = Vec::new();
+            let mut buffer = vec![0u8; 64 * 1024];
+            loop {
+                let mut read = 0u32;
+                if WinHttpReadData(
+                    request.0,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len() as u32,
+                    &mut read,
+                ) == 0
+                {
+                    return Err(last_error());
+                }
+                if read == 0 {
+                    break;
+                }
+                body.extend_from_slice(&buffer[..read as usize]);
+            }
+            Ok((status as u16, body))
+        }
+    }
 
     pub fn wait_for_exit(pid: u32, timeout: Duration) {
         unsafe {
@@ -213,6 +345,15 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
+    pub fn get(
+        _host: &str,
+        _path: &str,
+        _user_agent: &str,
+        _accept: Option<&str>,
+    ) -> Result<(u16, Vec<u8>), String> {
+        Err("updates are only supported on Windows".into())
+    }
+
     pub fn wait_for_exit(_pid: u32, timeout: std::time::Duration) {
         std::thread::sleep(timeout.min(std::time::Duration::from_secs(1)));
     }
@@ -240,6 +381,29 @@ mod tests {
         let result = check();
         println!("{result:?}");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn splits_urls() {
+        assert_eq!(
+            split_url("https://api.github.com/repos/a/b/releases/latest"),
+            Some(("api.github.com", "/repos/a/b/releases/latest"))
+        );
+        assert_eq!(split_url("https://example.com"), Some(("example.com", "/")));
+        assert_eq!(split_url("https://h/p?q=1"), Some(("h", "/p?q=1")));
+        assert_eq!(split_url("http://example.com/x"), None);
+        assert_eq!(split_url("https://example.com:8443/x"), None);
+        assert_eq!(split_url("https:///x"), None);
+    }
+
+    #[test]
+    #[ignore = "downloads the latest release from GitHub"]
+    fn downloads_release() {
+        let url = format!("https://github.com/{REPO}/releases/latest/download/{ASSET}");
+        let (status, body) = get(&url, None).unwrap();
+        println!("HTTP {status}, {} bytes", body.len());
+        assert_eq!(status, 200);
+        assert_eq!(&body[..2], b"MZ");
     }
 
     #[test]
