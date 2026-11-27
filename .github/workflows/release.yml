@@ -1,0 +1,42 @@
+name: Release
+
+# Push a tag "vX.Y.Z" matching the version in Cargo.toml to publish a release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Check that the tag matches the version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
+            exit 1
+          fi
+
+      # Builds the WSL agent first and embeds it (see crates/app/build.rs).
+      - run: cargo build --release --locked -p git-track
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp target/agent/x86_64-unknown-linux-musl/release/git-track-agent git-track-agent-x86_64-linux
+          gh release create "$GITHUB_REF_NAME" \
+            --title "git-track ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            target/release/git-track.exe \
+            git-track-agent-x86_64-linux
