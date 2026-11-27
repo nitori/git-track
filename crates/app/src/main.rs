@@ -10,6 +10,7 @@ mod scrollbar;
 mod settings;
 mod text_input;
 mod tray;
+mod update;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -17,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedReceiver;
-use git_track_core::{Event, PROTOCOL_VERSION, RepoStatus, Severity};
+use git_track_core::{Event, PROTOCOL_VERSION, RepoStatus, Severity, WatchCommand};
 use gpui::{
     AnyElement, AnyView, App, Application, Bounds, ClipboardItem, Context, Corner, Div, ElementId,
     Entity, FocusHandle, FontWeight, Hsla, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
@@ -77,7 +78,20 @@ struct Source {
     /// When the last full scan finished, and how long it took.
     last_scan: Option<(Instant, u64)>,
     task: Option<Task<()>>,
+    /// Keeps the listed repositories up to date between full scans.
+    watcher: Option<Watcher>,
+    /// When the watcher last stopped unexpectedly.
+    watch_ended: Option<Instant>,
 }
+
+struct Watcher {
+    id: usize,
+    commands: std::sync::mpsc::Sender<WatchCommand>,
+    _task: Task<()>,
+}
+
+/// A watcher that stopped is restarted no sooner than this (WSL shut down, …).
+const WATCH_RETRY: Duration = Duration::from_secs(60);
 
 impl Source {
     fn new(kind: SourceKind) -> Self {
@@ -92,6 +106,8 @@ impl Source {
             distro: None,
             last_scan: None,
             task: None,
+            watcher: None,
+            watch_ended: None,
         }
     }
 
@@ -127,7 +143,7 @@ impl Source {
         }
         self.warning = (protocol != PROTOCOL_VERSION).then(|| {
             format!(
-                "Agent {version} speaks protocol {protocol}, expected {PROTOCOL_VERSION}. Reinstall the agent inside WSL."
+                "Agent {version} speaks protocol {protocol}, expected {PROTOCOL_VERSION}. Rebuild the agent configured as [wsl] agent, or remove that setting to use the bundled one."
             )
         });
     }
@@ -213,6 +229,31 @@ impl Summary {
     }
 }
 
+/// State of the update check.
+#[derive(Default)]
+enum NewVersion {
+    #[default]
+    Unknown,
+    Checking,
+    Available(update::Release),
+    Installing(update::Release),
+}
+
+/// How often updates are looked for (the first time shortly after the start).
+const UPDATE_CHECK_EVERY: Duration = Duration::from_secs(12 * 60 * 60);
+const UPDATE_CHECK_FIRST: Duration = Duration::from_secs(30);
+
+/// Runs blocking work (network, file system) on a thread of its own.
+fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> futures::channel::oneshot::Receiver<T> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    rx
+}
+
 /// The dropdown that is currently open (only one at a time).
 #[derive(Clone, PartialEq, Eq)]
 enum OpenMenu {
@@ -230,18 +271,13 @@ struct GitTrack {
     show_clean: bool,
     /// Repositories currently being re-checked individually.
     busy: HashSet<(SourceKind, String)>,
-    /// Repositories an action was launched for; re-checked whenever the window
-    /// regains focus until they are clean.
-    touched: HashSet<(SourceKind, String)>,
     notice: Option<String>,
     last_full_refresh: Instant,
     scrollbar: scrollbar::Scrollbar,
     menu: Option<OpenMenu>,
     jetbrains: jetbrains::JetBrains,
-    /// A missing-repository lookup is running.
-    pruning: bool,
-    /// Last time all WSL repositories were re-checked on window activation.
-    last_wsl_sweep: Option<Instant>,
+    /// Ids for watchers, to tell a stale one's end from the current one's.
+    watchers_started: usize,
     /// When the window last lost the focus.
     deactivated_at: Option<Instant>,
     /// Decided when the tray icon is pressed: the click hides the window.
@@ -253,8 +289,12 @@ struct GitTrack {
     tray: Option<tray::Tray>,
     /// The open settings dialog.
     settings: Option<(Entity<settings::Settings>, Subscription)>,
+    new_version: NewVersion,
+    /// The available version the user postponed ("Later").
+    postponed_version: Option<String>,
     _commands_task: Task<()>,
     _ticker: Task<()>,
+    _update_ticker: Task<()>,
     _activation: Subscription,
 }
 
@@ -264,13 +304,14 @@ impl GitTrack {
         cx: &mut Context<Self>,
         instance_commands: UnboundedReceiver<tray::Command>,
         hidden: bool,
+        updated: bool,
     ) -> Self {
         let (config, config_error) = match Config::load() {
             Ok(config) => (config, None),
             Err(e) => (Config::default(), Some(e)),
         };
 
-        let mut notice = None;
+        let mut notice = updated.then(|| format!("Updated to git-track {}.", update::CURRENT));
         let (tray, tray_commands) = if config.close_to_tray {
             match tray::Tray::new() {
                 Ok((tray, commands)) => (Some(tray), Some(commands)),
@@ -349,12 +390,27 @@ impl GitTrack {
                     {
                         this.refresh_all(cx);
                     }
-                    this.prune_missing(cx);
                     cx.notify();
                 });
                 if alive.is_err() {
                     break;
                 }
+            }
+        });
+
+        // Debug builds are being worked on; they only check when asked to.
+        let update_ticker = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(UPDATE_CHECK_FIRST).await;
+            loop {
+                let alive = this.update(cx, |this, cx| {
+                    if this.config.check_updates && !cfg!(debug_assertions) {
+                        this.check_update(false, cx);
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+                cx.background_executor().timer(UPDATE_CHECK_EVERY).await;
             }
         });
 
@@ -364,22 +420,23 @@ impl GitTrack {
             sources: SOURCES.into_iter().map(Source::new).collect(),
             show_clean: false,
             busy: HashSet::new(),
-            touched: HashSet::new(),
             notice,
             last_full_refresh: Instant::now(),
             scrollbar: scrollbar::Scrollbar::default(),
             menu: None,
             jetbrains: jetbrains::JetBrains::load(),
-            pruning: false,
-            last_wsl_sweep: None,
+            watchers_started: 0,
             deactivated_at: None,
             tray_click_hides: false,
             never_shown: hidden,
             focus,
             tray,
             settings: None,
+            new_version: NewVersion::Unknown,
+            postponed_version: None,
             _commands_task: commands_task,
             _ticker: ticker,
+            _update_ticker: update_ticker,
             _activation: activation,
         };
         if hidden && this.tray.is_none() {
@@ -420,10 +477,10 @@ impl GitTrack {
         };
         let view = cx.new(|cx| settings::Settings::new(draft, load_error, cx));
         let subscription = cx.subscribe_in(&view, window, |this, _, event, window, cx| {
-            if let settings::SettingsEvent::Saved = event {
-                this.apply_settings(cx);
+            match event {
+                settings::SettingsEvent::Saved => this.apply_settings(cx),
+                settings::SettingsEvent::Closed => this.close_settings(window, cx),
             }
-            this.close_settings(window, cx);
         });
         self.settings = Some((view, subscription));
         cx.notify();
@@ -459,6 +516,10 @@ impl GitTrack {
             || old.windows != new.windows
             || old.wsl != new.wsl;
         if rescan {
+            // Restarted with the new settings (distribution, …) after the scan.
+            for source in &mut self.sources {
+                source.watcher = None;
+            }
             self.start_all(cx);
         }
         self.sync_tray();
@@ -484,6 +545,7 @@ impl GitTrack {
                 self.config = config;
                 self.config_error = None;
                 self.apply_ignores();
+                self.sync_watcher(kind, cx);
                 self.sync_tray();
             }
             Err(e) => self.notice = Some(e),
@@ -504,6 +566,129 @@ impl GitTrack {
             for path in ignored {
                 self.remove_repo(kind, &path);
             }
+        }
+    }
+
+    /// Looks for a newer release in the background.
+    fn check_update(&mut self, manual: bool, cx: &mut Context<Self>) {
+        match &self.new_version {
+            NewVersion::Checking | NewVersion::Installing(_) => return,
+            // Asked again: show the banner again.
+            NewVersion::Available(_) if manual => {
+                self.postponed_version = None;
+                cx.notify();
+                return;
+            }
+            _ => {}
+        }
+        self.new_version = NewVersion::Checking;
+        let result = blocking(update::check);
+        cx.spawn(async move |this, cx| {
+            let result = result
+                .await
+                .unwrap_or_else(|_| Err("the update check stopped".into()));
+            this.update(cx, |this, cx| {
+                this.new_version = NewVersion::Unknown;
+                match result {
+                    Ok(Some(release)) => this.new_version = NewVersion::Available(release),
+                    Ok(None) if manual => {
+                        this.notice = Some(format!(
+                            "git-track {} is the latest version.",
+                            update::CURRENT
+                        ))
+                    }
+                    Err(e) if manual => this.notice = Some(e),
+                    // Automatic checks stay quiet (offline, rate limit, …).
+                    _ => {}
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Downloads the available release, replaces this executable and restarts.
+    fn install_update(&mut self, cx: &mut Context<Self>) {
+        let NewVersion::Available(release) = std::mem::take(&mut self.new_version) else {
+            return;
+        };
+        self.new_version = NewVersion::Installing(release.clone());
+        let result = blocking({
+            let release = release.clone();
+            move || update::install(&release)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = result
+                .await
+                .unwrap_or_else(|_| Err("the installation stopped".into()));
+            this.update(cx, |this, cx| {
+                match result.map(|()| update::restart()) {
+                    Ok(Ok(())) => return this.quit(cx),
+                    Ok(Err(e)) => {
+                        this.new_version = NewVersion::Unknown;
+                        this.notice = Some(format!(
+                            "git-track {} is installed, but it could not be started ({e}). Restart git-track.",
+                            release.version
+                        ));
+                    }
+                    Err(e) => {
+                        this.new_version = NewVersion::Available(release);
+                        this.notice = Some(format!("The update failed: {e}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn render_update_banner(&self, cx: &mut Context<Self>) -> Option<Div> {
+        match &self.new_version {
+            NewVersion::Available(release)
+                if self.postponed_version.as_ref() != Some(&release.version) =>
+            {
+                let notes = release.notes_url.clone();
+                let version = release.version.clone();
+                Some(
+                    banner(
+                        format!(
+                            "git-track {} is available (you have {}).",
+                            release.version,
+                            update::CURRENT
+                        ),
+                        ACCENT,
+                        HEADER,
+                    )
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(div().flex_1())
+                    .child(
+                        button("update-notes", "Release notes")
+                            .on_click(move |_, _, cx| cx.open_url(&notes)),
+                    )
+                    .child(button("update-later", "Later").on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.postponed_version = Some(version.clone());
+                            cx.notify();
+                        },
+                    )))
+                    .child(
+                        button("update-install", "Install and restart")
+                            .on_click(cx.listener(|this, _, _, cx| this.install_update(cx))),
+                    ),
+                )
+            }
+            NewVersion::Installing(release) => Some(banner(
+                format!("Downloading git-track {}…", release.version),
+                ACCENT,
+                HEADER,
+            )),
+            _ => None,
         }
     }
 
@@ -583,6 +768,7 @@ impl GitTrack {
             } else {
                 let source = self.source_mut(kind);
                 source.task = None;
+                source.watcher = None;
                 source.phase = Phase::Idle;
                 source.repos.clear();
             }
@@ -599,7 +785,11 @@ impl GitTrack {
         let task = cx.spawn(async move |this, cx| {
             while let Some(msg) = rx.next().await {
                 let alive = this.update(cx, |this, cx| {
+                    let done = matches!(msg, Msg::Event(Event::Done { .. }));
                     this.source_mut(kind).apply_scan(msg);
+                    if done {
+                        this.sync_watcher(kind, cx);
+                    }
                     this.sync_tray();
                     cx.notify();
                 });
@@ -663,75 +853,117 @@ impl GitTrack {
     /// Drops a deleted repository from the list.
     fn remove_repo(&mut self, kind: SourceKind, path: &str) {
         self.source_mut(kind).repos.remove(path);
-        self.touched.remove(&(kind, path.to_string()));
     }
 
-    /// Removes Windows repositories whose `.git` no longer exists. Only file
-    /// lookups, on a background thread. Repositories whose root is missing
-    /// too (e.g. an unplugged drive) are kept; the next scan reports that.
-    fn prune_missing(&mut self, cx: &mut Context<Self>) {
-        if self.pruning || !self.config.enabled(SourceKind::Windows) {
-            return;
+    /// Starts the watcher of `kind` unless it runs already (or may not run
+    /// yet). Returns whether it runs.
+    fn ensure_watcher(&mut self, kind: SourceKind, cx: &mut Context<Self>) -> bool {
+        if !self.config.enabled(kind) {
+            return false;
         }
-        let repos: Vec<(String, Option<String>)> = self
-            .source(SourceKind::Windows)
-            .repos
-            .values()
-            .map(|r| (r.path.clone(), r.root.clone()))
-            .collect();
-        if repos.is_empty() {
-            return;
+        let source = self.source(kind);
+        if source.watcher.is_some() {
+            return true;
         }
-        self.pruning = true;
-        let lookup = cx.background_spawn(async move {
-            repos
-                .into_iter()
-                .filter(|(path, root)| {
-                    git_track_core::discover::is_gone(Path::new(path))
-                        && root.as_deref().is_none_or(|r| Path::new(r).is_dir())
-                })
-                .map(|(path, _)| path)
-                .collect::<Vec<_>>()
-        });
-        cx.spawn(async move |this, cx| {
-            let gone = lookup.await;
-            this.update(cx, |this, cx| {
-                this.pruning = false;
-                if !gone.is_empty() {
-                    for path in &gone {
-                        this.remove_repo(SourceKind::Windows, path);
+        // Not restarted in a loop while it keeps failing (e.g. WSL shut down).
+        if source.watch_ended.is_some_and(|t| t.elapsed() < WATCH_RETRY) {
+            return false;
+        }
+        self.watchers_started += 1;
+        let id = self.watchers_started;
+        let (commands, mut rx) = scanner::start_watch(kind, &self.config);
+        let task = cx.spawn(async move |this, cx| {
+            while let Some(msg) = rx.next().await {
+                let alive = this.update(cx, |this, cx| {
+                    match msg {
+                        Msg::Failed(message) => {
+                            // A failing scan already explains it.
+                            if this.source(kind).error.is_none() {
+                                this.notice = Some(format!(
+                                    "Watching the {kind:?} repositories stopped: {message}"
+                                ));
+                            }
+                        }
+                        msg => this.apply_recheck(kind, msg),
                     }
                     this.sync_tray();
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
+            this.update(cx, |this, cx| {
+                let source = this.source_mut(kind);
+                if source.watcher.as_ref().is_some_and(|w| w.id == id) {
+                    source.watcher = None;
+                    source.watch_ended = Some(Instant::now());
                     cx.notify();
                 }
             })
             .ok();
-        })
-        .detach();
+        });
+        self.source_mut(kind).watcher = Some(Watcher {
+            id,
+            commands,
+            _task: task,
+        });
+        true
+    }
+
+    /// Hands the listed repositories of `kind` to its watcher.
+    fn sync_watcher(&mut self, kind: SourceKind, cx: &mut Context<Self>) {
+        if !self.ensure_watcher(kind, cx) {
+            return;
+        }
+        let repos = self
+            .source(kind)
+            .repos
+            .values()
+            .filter(|r| !self.config.is_ignored(kind, &r.path))
+            .cloned()
+            .collect();
+        let options = self.config.request(kind, Vec::new()).options;
+        self.send_watch(kind, WatchCommand::Set { options, repos });
+    }
+
+    fn send_watch(&mut self, kind: SourceKind, command: WatchCommand) {
+        let source = self.source_mut(kind);
+        if let Some(watcher) = &source.watcher
+            && watcher.commands.send(command).is_err()
+        {
+            source.watcher = None;
+            source.watch_ended = Some(Instant::now());
+        }
     }
 
     /// The window became active: catch up with what the user did meanwhile.
     fn on_activated(&mut self, cx: &mut Context<Self>) {
-        self.prune_missing(cx);
-
-        // Checking WSL paths from Windows could wake an idle WSL VM and cannot
-        // tell "deleted" from "WSL unavailable", so let the agent re-check all
-        // listed WSL repositories instead (fast; at most once a minute).
-        let wsl = SourceKind::Wsl;
-        let sweep_due = self
-            .last_wsl_sweep
-            .is_none_or(|t| t.elapsed() >= Duration::from_secs(60));
-        if sweep_due && self.config.enabled(wsl) && !self.source(wsl).scanning() {
-            self.last_wsl_sweep = Some(Instant::now());
-            let paths = self.source(wsl).repos.keys().cloned().collect();
-            self.recheck_many(wsl, paths, cx);
+        for kind in SOURCES {
+            let source = self.source(kind);
+            if source.watcher.is_none() {
+                // While scanning (or before the first scan) the scan starts it.
+                if source.scanning() || source.last_scan.is_none() {
+                    continue;
+                }
+                self.sync_watcher(kind, cx);
+            }
+            self.send_watch(kind, WatchCommand::Activated);
         }
-        self.recheck_touched(cx);
+    }
+
+    /// Expect changes in `path` soon (an action or IDE was launched for it).
+    fn touch(&mut self, kind: SourceKind, path: String) {
+        self.send_watch(kind, WatchCommand::Touch { paths: vec![path] });
     }
 
     fn apply_recheck(&mut self, kind: SourceKind, msg: Msg) {
         match msg {
             Msg::Event(Event::Repo(mut repo)) => {
+                // Ignored just now; the watcher may not know yet.
+                if self.config.is_ignored(kind, &repo.path) {
+                    return;
+                }
                 let source = self.source_mut(kind);
                 if repo.root.is_none() {
                     repo.root = source
@@ -739,12 +971,7 @@ impl GitTrack {
                         .get(&repo.path)
                         .and_then(|old| old.root.clone());
                 }
-                let key = (kind, repo.path.clone());
-                let clean = repo.is_clean();
                 source.repos.insert(repo.path.clone(), repo);
-                if clean {
-                    self.touched.remove(&key);
-                }
             }
             Msg::Event(Event::Gone { path }) => self.remove_repo(kind, &path),
             Msg::Event(Event::Hello {
@@ -761,18 +988,6 @@ impl GitTrack {
         }
     }
 
-    fn recheck_touched(&mut self, cx: &mut Context<Self>) {
-        for kind in SOURCES {
-            let paths = self
-                .touched
-                .iter()
-                .filter(|(k, _)| *k == kind)
-                .map(|(_, path)| path.clone())
-                .collect();
-            self.recheck_many(kind, paths, cx);
-        }
-    }
-
     fn run_action(&mut self, kind: SourceKind, index: usize, path: String, cx: &mut Context<Self>) {
         let Some(action) = self.config.actions_for(kind).nth(index).cloned() else {
             return;
@@ -784,9 +999,7 @@ impl GitTrack {
             distro: distro.as_deref(),
         };
         match actions::launch(&action, &vars) {
-            Ok(()) => {
-                self.touched.insert((kind, path));
-            }
+            Ok(()) => self.touch(kind, path),
             Err(e) => self.notice = Some(e),
         }
         cx.notify();
@@ -805,9 +1018,7 @@ impl GitTrack {
             return;
         };
         match jetbrains::launch(ide, kind, project, self.distro(kind).as_deref()) {
-            Ok(()) => {
-                self.touched.insert((kind, repo));
-            }
+            Ok(()) => self.touch(kind, repo),
             Err(e) => self.notice = Some(e),
         }
         cx.notify();
@@ -1088,6 +1299,21 @@ impl GitTrack {
                                 )))
                             })
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_autostart(cx))),
+                        )
+                        .child(
+                            menu_item(
+                                "check-update",
+                                if matches!(self.new_version, NewVersion::Checking) {
+                                    "Checking for updates…"
+                                } else {
+                                    "Check for updates"
+                                },
+                                None,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.check_update(true, cx);
+                                this.close_menu(cx);
+                            })),
                         )
                         .child(menu_separator())
                         .child(
@@ -1592,6 +1818,7 @@ impl Render for GitTrack {
                 }),
             )
             .child(self.render_header(window, cx))
+            .children(self.render_update_banner(cx))
             .children(self.config_error.clone().map(|e| {
                 banner(
                     format!("Config error (using previous/default settings): {e}"),
@@ -1645,6 +1872,8 @@ impl Render for GitTrack {
 }
 
 fn main() {
+    // Before the single-instance check: the previous version may still be exiting.
+    let updated = update::after_start();
     // Started at login: stay in the tray (shown anyway if there is no tray icon).
     let hidden = autostart::launched();
     let instance_commands = match instance::acquire() {
@@ -1678,7 +1907,9 @@ fn main() {
                 show: !hidden,
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| GitTrack::new(window, cx, instance_commands, hidden)),
+            |window, cx| {
+                cx.new(|cx| GitTrack::new(window, cx, instance_commands, hidden, updated))
+            },
         )
         .expect("failed to open window");
         if !hidden {

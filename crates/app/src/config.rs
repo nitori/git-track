@@ -24,6 +24,10 @@ refresh_interval_secs = 600
 # "Menu ▾" → Quit or Ctrl+Q). false = no tray icon, closing quits. Needs a restart.
 close_to_tray = true
 
+# Look for a new release on GitHub after starting and twice a day. Installing
+# an update always asks first.
+check_updates = true
+
 # What counts as "not pushed". Set an entry to false to ignore that kind of issue.
 [track]
 staged = true           # changes added to the index
@@ -73,9 +77,11 @@ enabled = true
 roots = ["~/projects"]
 # Repositories and folders to skip (everything at or below these paths).
 ignore = []
-# git-track-agent inside WSL. A leading "~/" means the WSL home directory.
-# Install it from a WSL shell with: cargo install --path crates/agent
-agent = "~/.cargo/bin/git-track-agent"
+# git-track brings its own agent for WSL and installs it automatically (to
+# ~/.local/share/git-track). To use your own build instead, set its path
+# ("~/" is the WSL home directory). "~/.cargo/bin/git-track-agent", the default
+# of older versions, is ignored; spell out the home directory for that one:
+# agent = "/home/me/.cargo/bin/git-track-agent"
 
 # Buttons shown next to each repository.
 #   target:   "windows" or "wsl"
@@ -116,6 +122,7 @@ command = ["explorer.exe", "{unc}"]
 pub struct Config {
     pub refresh_interval_secs: u64,
     pub close_to_tray: bool,
+    pub check_updates: bool,
     pub track: TrackOptions,
     pub scan: ScanOptions,
     pub jetbrains: JetBrainsConfig,
@@ -152,8 +159,23 @@ pub struct WslConfig {
     pub distro: Option<String>,
     pub roots: Vec<String>,
     pub ignore: Vec<String>,
-    pub agent: String,
+    /// Own agent build; the bundled one is used if unset.
+    pub agent: Option<String>,
     pub git: Option<String>,
+}
+
+/// Where `cargo install` puts the agent. Older config files contain this as
+/// the (then default) value, which now means "bundled" as well.
+pub const CARGO_AGENT: &str = "~/.cargo/bin/git-track-agent";
+
+impl WslConfig {
+    /// The agent configured explicitly, if any.
+    pub fn custom_agent(&self) -> Option<&str> {
+        self.agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty() && *a != CARGO_AGENT)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -173,6 +195,7 @@ impl Default for Config {
         Self {
             refresh_interval_secs: 600,
             close_to_tray: true,
+            check_updates: true,
             track: TrackOptions::default(),
             scan: ScanOptions::default(),
             jetbrains: JetBrainsConfig::default(),
@@ -215,7 +238,7 @@ impl Default for WslConfig {
             distro: None,
             roots: vec!["~/projects".into()],
             ignore: Vec::new(),
-            agent: "~/.cargo/bin/git-track-agent".into(),
+            agent: None,
             git: None,
         }
     }
@@ -310,6 +333,7 @@ impl Config {
             (self.refresh_interval_secs as i64).into(),
         );
         set(root, "close_to_tray", self.close_to_tray.into());
+        set(root, "check_updates", self.check_updates.into());
 
         let track = table(root, "track")?;
         for name in TrackOptions::NAMES {

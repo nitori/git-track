@@ -81,10 +81,16 @@ pub struct Settings {
     /// "Add" inputs for every (source, list).
     inputs: Vec<((SourceKind, List), Entity<TextInput>)>,
     error: Option<String>,
+    /// Generation of the "Saved" message while it is shown.
+    saved: Option<usize>,
+    saves: usize,
     page: Page,
     scrollbar: Scrollbar,
     _subscriptions: Vec<Subscription>,
 }
+
+/// How long the "Saved" message stays.
+const SAVED_SHOWN: Duration = Duration::from_secs(3);
 
 impl EventEmitter<SettingsEvent> for Settings {}
 
@@ -138,6 +144,8 @@ impl Settings {
             distro,
             inputs,
             error: load_error.map(|e| format!("The config file has errors, saving may fail: {e}")),
+            saved: None,
+            saves: 0,
             page: Page::General,
             scrollbar: Scrollbar::default(),
             _subscriptions: subscriptions,
@@ -240,12 +248,30 @@ impl Settings {
 
     fn save(&mut self, cx: &mut Context<Self>) {
         match self.try_save(cx) {
-            Ok(()) => cx.emit(SettingsEvent::Saved),
+            Ok(()) => {
+                self.error = None;
+                self.saves += 1;
+                let generation = self.saves;
+                self.saved = Some(generation);
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(SAVED_SHOWN).await;
+                    this.update(cx, |this, cx| {
+                        if this.saved == Some(generation) {
+                            this.saved = None;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+                cx.emit(SettingsEvent::Saved);
+            }
             Err(e) => {
                 self.error = Some(e);
-                cx.notify();
+                self.saved = None;
             }
         }
+        cx.notify();
     }
 
     fn try_save(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
@@ -410,6 +436,7 @@ impl Settings {
 
     fn render_general(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let tray = self.draft.close_to_tray;
+        let updates = self.draft.check_updates;
         let jetbrains = self.draft.jetbrains.enabled;
         let autostart = self.autostart;
         div()
@@ -464,6 +491,17 @@ impl Settings {
                 }))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.autostart = !autostart;
+                    cx.notify();
+                })),
+            )
+            .child(
+                checkbox(
+                    "settings:updates",
+                    updates,
+                    "Check for new versions (installing always asks first)",
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.draft.check_updates = !updates;
                     cx.notify();
                 })),
             )
@@ -656,8 +694,23 @@ impl Render for Settings {
                             "Actions, excluded folder names and branches: edit the config file",
                         ),
                     )
+                    .children(self.saved.map(|generation| {
+                        div()
+                            .id(id(format_args!("settings:saved{generation}")))
+                            .flex_shrink_0()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(OK))
+                            .child("✓ Saved")
+                            .with_animation(
+                                id(format_args!("settings:saved-fade{generation}")),
+                                Animation::new(SAVED_SHOWN),
+                                // Quick fade-in, hold, fade out at the end.
+                                |label, t| label.opacity((t / 0.05).min((1. - t) / 0.15).min(1.)),
+                            )
+                    }))
                     .child(
-                        button("settings:cancel", "Cancel")
+                        button("settings:close", "Close")
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Closed))),
                     )
                     .child(

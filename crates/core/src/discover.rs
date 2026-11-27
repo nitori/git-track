@@ -109,19 +109,28 @@ pub fn discover(
 /// `Ok(false)`: definitely no repository (`.git` missing, empty or broken).
 /// `Err`: cannot tell (permissions, unreachable drive, …).
 pub fn repo_marker(dir: &Path) -> io::Result<bool> {
+    Ok(git_dirs(dir)?.is_some())
+}
+
+/// The git directories of the repository at `dir`, validated like
+/// [`repo_marker`]: `(git_dir, common_dir)`. They differ for linked
+/// worktrees, whose refs (except `HEAD`) live in the common directory.
+///
+/// `Ok(None)`: no (valid) repository.
+pub fn git_dirs(dir: &Path) -> io::Result<Option<GitDirs>> {
     let dot_git = dir.join(".git");
     let meta = match fs::metadata(&dot_git) {
         Ok(meta) => meta,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
     if meta.is_dir() {
-        return git_dir_valid(&dot_git);
+        return validate_git_dir(dot_git);
     }
     let text = match fs::read_to_string(&dot_git) {
         Ok(text) => text,
         // Not UTF-8: certainly not a "gitdir:" file.
-        Err(e) if e.kind() == io::ErrorKind::InvalidData => return Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => return Ok(None),
         Err(e) => return Err(e),
     };
     let Some(target) = text
@@ -131,19 +140,46 @@ pub fn repo_marker(dir: &Path) -> io::Result<bool> {
         .map(str::trim)
         .filter(|t| !t.is_empty())
     else {
-        return Ok(false);
+        return Ok(None);
     };
-    git_dir_valid(&dir.join(target))
+    validate_git_dir(dir.join(target))
 }
 
-fn git_dir_valid(git_dir: &Path) -> io::Result<bool> {
+/// `git_dir` and the directory holding the shared refs (see [`git_dirs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitDirs {
+    pub git_dir: PathBuf,
+    pub common_dir: PathBuf,
+}
+
+fn validate_git_dir(git_dir: PathBuf) -> io::Result<Option<GitDirs>> {
     match fs::metadata(git_dir.join("HEAD")) {
         Ok(meta) if meta.is_file() => {}
-        Ok(_) => return Ok(false),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Ok(_) => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     }
-    Ok(git_dir.join("objects").is_dir() || git_dir.join("commondir").is_file())
+    let common_dir = match fs::read_to_string(git_dir.join("commondir")) {
+        Ok(text) => {
+            let rel = text.trim();
+            if rel.is_empty() {
+                return Ok(None);
+            }
+            git_dir.join(rel)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if !git_dir.join("objects").is_dir() {
+                return Ok(None);
+            }
+            git_dir.clone()
+        }
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    Ok(Some(GitDirs {
+        git_dir,
+        common_dir,
+    }))
 }
 
 /// True if `repo` is definitely no repository (anymore): its `.git` (or the

@@ -2,11 +2,11 @@
 //! scan --stdin`), writes a JSON `ScanRequest` to stdin and reads NDJSON
 //! events from stdout. It is also usable on its own from a terminal.
 
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::process::ExitCode;
-use std::sync::Mutex;
+use std::sync::{Mutex, mpsc};
 
-use git_track_core::{Event, PROTOCOL_VERSION, ScanRequest, Severity, scan};
+use git_track_core::{Event, PROTOCOL_VERSION, ScanRequest, Severity, WatchCommand, scan, watch};
 
 const USAGE: &str = "\
 git-track-agent — find git repositories with unpushed work
@@ -15,6 +15,7 @@ USAGE:
     git-track-agent scan [OPTIONS] [ROOT]...
     git-track-agent scan --stdin          (read a JSON ScanRequest, used by the GUI)
     git-track-agent check [OPTIONS] REPO...
+    git-track-agent watch                 (read NDJSON WatchCommands until stdin closes, used by the GUI)
 
 OPTIONS:
     --json               Emit NDJSON events instead of text
@@ -47,6 +48,10 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
     let command = match it.next().as_deref() {
         Some("scan") => Command::Scan,
         Some("check") => Command::Check,
+        Some("watch") => {
+            run_watch();
+            return Ok(ExitCode::SUCCESS);
+        }
         Some("-V" | "--version") => {
             println!(
                 "git-track-agent {} (protocol {PROTOCOL_VERSION})",
@@ -157,9 +162,10 @@ fn absolutize(p: &str) -> String {
         .into_owned()
 }
 
-fn run_json(request: &ScanRequest) {
+/// Writes events as NDJSON to stdout, starting with `Hello`.
+fn json_emitter() -> impl Fn(Event) + Sync {
     let out = Mutex::new(io::stdout());
-    let emit = |event: Event| {
+    let emit = move |event: Event| {
         let Ok(line) = serde_json::to_string(&event) else {
             return;
         };
@@ -172,7 +178,35 @@ fn run_json(request: &ScanRequest) {
         protocol: PROTOCOL_VERSION,
         distro: std::env::var("WSL_DISTRO_NAME").ok(),
     });
-    scan(request, &emit);
+    emit
+}
+
+fn run_json(request: &ScanRequest) {
+    scan(request, &json_emitter());
+}
+
+/// Watches repositories as told on stdin; ends when stdin is closed.
+fn run_watch() {
+    let emit = json_emitter();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<WatchCommand>(&line) {
+                Ok(command) => {
+                    if tx.send(command).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => eprintln!("invalid watch command ({e}): {line}"),
+            }
+        }
+        // Dropping `tx` ends the watcher.
+    });
+    watch::watch(rx, &emit);
 }
 
 fn run_text(request: &ScanRequest, show_clean: bool) -> ExitCode {

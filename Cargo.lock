@@ -2044,11 +2044,13 @@ dependencies = [
  "roxmltree 0.21.2",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "toml 1.2.2+spec-1.1.0",
  "toml_edit 0.25.20+spec-1.1.0",
  "tray-icon",
  "unicode-segmentation",
  "windows-sys 0.61.2",
+ "zed-reqwest",
 ]
 
 [[package]]
@@ -7093,6 +7095,7 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

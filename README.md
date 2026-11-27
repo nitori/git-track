@@ -51,24 +51,28 @@ crates/app     git-track: the GPUI app (Windows)
 
 ## Setup
 
-1. **Agent in WSL** (from a WSL shell in this repo):
+Download `git-track.exe` from the
+[releases](https://github.com/nitori/git-track/releases) and start it; it is
+portable (no installer). Or build it on Windows:
 
-   ```sh
-   cargo install --path crates/agent --locked
-   ```
+```bat
+rustup target add x86_64-unknown-linux-musl
+cargo build --release -p git-track
+target\release\git-track.exe
+```
 
-   This puts `git-track-agent` into `~/.cargo/bin/`, the default path the app uses.
-   Rebuild it after changing `crates/core` or `crates/agent`.
+(`cargo build` without `-p` builds only core + agent; the app is excluded from
+the default members so building in WSL does not pull in GPUI.)
 
-2. **App on Windows**:
-
-   ```bat
-   cargo build --release -p git-track
-   target\release\git-track.exe
-   ```
-
-   (`cargo build` without `-p` builds only core + agent; the app is excluded
-   from the default members so building in WSL does not pull in GPUI.)
+The **WSL agent is bundled**: the app's build script builds it for
+`x86_64-unknown-linux-musl` (linked with Rust's own `rust-lld`, no Linux
+toolchain needed) and embeds it. On the first WSL scan of a run, the app
+copies it to `~/.local/share/git-track/agent-<hash>` inside WSL unless that
+exact build is there already. Agents of other builds are deleted after a week
+without use. If the musl target is missing, the build prints a warning and the
+app falls back to a self-installed agent. To use your own agent build (e.g.
+for another architecture), `cargo install --path crates/agent --locked` inside
+WSL and set `agent` under `[wsl]` to its full path.
 
 On first start a fully commented config with all defaults is created at
 `%APPDATA%\git-track\config.toml`. No Windows folders are scanned until you add
@@ -77,9 +81,9 @@ some (WSL starts with `~/projects`).
 **Settings** ("Menu ▾" → *Settings…* or Ctrl+,) edits the common options: the
 folders to scan and ignored paths per side (type a path or *Browse…*; for WSL
 pick a folder below `\\wsl.localhost\<distro>`), the WSL distribution, the
-reported issue kinds, the rescan interval, tray, autostart and the JetBrains
-button. Saving writes them into the config file and keeps its comments and
-everything else. Actions, excluded folder names, branches and depth are edited
+reported issue kinds, the rescan interval, tray, autostart, the update check
+and the JetBrains button. *Save* writes them into the config file, keeping its
+comments and everything else, and leaves the dialog open. Actions, excluded folder names, branches and depth are edited
 in the file itself ("Menu ▾" → *Open config in default editor*); it is re-read
 on every full refresh.
 
@@ -90,8 +94,6 @@ on every full refresh.
 * **↻** — re-check a single repository (no discovery, fast).
 * Action buttons (Git Bash, Terminal, Explorer, WSL Terminal, …) are defined in
   the config as `[[actions]]` with `{path}`, `{distro}` and `{unc}` placeholders.
-  Repositories an action was launched for are re-checked automatically whenever
-  the window regains focus, so they disappear right after you push.
 * **JetBrains projects**: if the repository or a parent directory (up to the
   root) contains a `.idea` folder, a button opens that project in its IDE. The
   IDE is taken from the IDEs' recent projects lists
@@ -100,11 +102,27 @@ on every full refresh.
   (from JetBrains Toolbox's `state.json`, or `product-info.json` in
   `%LOCALAPPDATA%\Programs` / `%ProgramFiles%\JetBrains`). WSL projects are opened
   via `\\wsl.localhost\…`. Disable with `[jetbrains] enabled = false`.
-* **Deleted repositories** (just `.git` or the whole folder) disappear from the
-  list without a full rescan: Windows repositories are looked up every 15 s and
-  when the window is activated; WSL repositories are re-checked by the agent on
-  activation (at most once a minute). A re-check (↻) of a deleted repository
-  removes it, too.
+* **Live updates** between full scans: a watcher per side (in-process for
+  Windows, a long-running agent inside WSL) compares the directory listings of
+  every known repository's `.git` and `refs/`. That covers `HEAD`, the index,
+  branch and remote refs, the stash and so on. No git process runs, and on
+  Windows no file is even opened, so hundreds of repositories cost little.
+  * A change means git did something (commit, checkout, push, fetch, stash).
+    The repository is then re-checked at once, and every 8 s for the next
+    5 minutes, which also catches edits to working-tree files.
+  * Those "hot" repositories and the ones with issues are compared every 3 s.
+    The quiet clean ones (usually the vast majority) are compared every 30 s,
+    and all of them right away when the window is activated.
+  * Repositories with issues are re-checked every minute anyway.
+  * Launching an action or IDE marks the repository as hot in advance.
+  * This covers clean repositories too, so a fresh commit in one shows up
+    within 30 s at most (at once on activation), and a pushed one disappears.
+  * Deleted repositories (just `.git` or the whole folder) are removed. If
+    their root is missing too (an unplugged drive), they stay until the next
+    scan.
+  * The WSL watcher keeps WSL from shutting down when idle while git-track
+    runs. If WSL is shut down anyway, the watcher restarts at the next scan or
+    window activation, at most once a minute.
 * **Ignore ▾** on a repository hides it, or one of its parent folders (below the
   scan root), from now on: ignored paths are skipped during discovery. Undo it
   in Settings (or `ignore = [...]` under `[windows]` / `[wsl]`).
@@ -124,6 +142,14 @@ on every full refresh.
 * **Single instance**: starting git-track again just brings the running instance
   to the front. This is per executable path, so a debug and a release build can
   run side by side.
+* **Updates**: 30 s after the start and then every 12 hours, git-track asks the
+  GitHub API for the latest release (`check_updates = true`; release builds
+  only; "Menu ▾" → *Check for updates* works always). A newer version shows a
+  banner. *Install and restart* downloads `git-track.exe` and verifies its
+  SHA-256 against the digest GitHub lists for it. It then swaps it with the
+  running executable (the old one becomes `git-track.exe.old`, deleted on the
+  next start) and restarts. The executable path stays the same, so autostart
+  keeps working.
 
 The icons are generated by `crates/app/assets/make_icons.py`
 (`uv run --with pillow make_icons.py` in that directory) and embedded as Windows
@@ -141,8 +167,22 @@ git-track-agent scan --json ~/projects     # NDJSON events
 ```
 
 The app talks to it with `wsl.exe [-d distro] --cd ~ -e <agent> scan --stdin`:
-a JSON `ScanRequest` on stdin, NDJSON `Event`s on stdout (see
+a JSON `ScanRequest` on stdin, NDJSON `Event`s on stdout. `watch` keeps
+running and reads NDJSON `WatchCommand`s from stdin until it is closed (see
 `crates/core/src/protocol.rs`).
+
+## Releasing
+
+CI (`.github/workflows/ci.yml`) runs clippy and the tests on Linux (core,
+agent) and Windows (app) for every push to `master` and every pull request.
+To publish a release:
+
+1. Bump `version` in the root `Cargo.toml` and commit.
+2. `git tag vX.Y.Z && git push origin master vX.Y.Z`
+
+`release.yml` checks that the tag matches the version, builds the app on
+Windows (with the bundled agent) and creates the GitHub release with
+`git-track.exe` and the standalone `git-track-agent-x86_64-linux`.
 
 ## Notes
 

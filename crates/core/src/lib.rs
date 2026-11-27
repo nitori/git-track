@@ -4,6 +4,7 @@
 pub mod check;
 pub mod discover;
 pub mod protocol;
+pub mod watch;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;

@@ -1,12 +1,13 @@
 //! Data types shared between the GUI and the agent.
 //!
 //! The agent streams [`Event`]s as newline-delimited JSON on stdout; the GUI
-//! sends a single [`ScanRequest`] as JSON on the agent's stdin.
+//! sends a single [`ScanRequest`] as JSON on the agent's stdin (`scan`), or
+//! a stream of [`WatchCommand`]s (`watch`).
 
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 pub fn default_exclude_dirs() -> Vec<String> {
     [
@@ -184,6 +185,22 @@ pub struct ScanRequest {
     /// nor checked. A leading `~` is expanded to the home directory.
     pub ignore: Vec<String>,
     pub options: ScanOptions,
+}
+
+/// Commands for a running watcher (`git-track-agent watch`), sent as NDJSON
+/// on its stdin. It answers with `Repo` / `Gone` events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum WatchCommand {
+    /// Replaces the watched repositories with these (just checked) ones.
+    Set {
+        options: ScanOptions,
+        repos: Vec<RepoStatus>,
+    },
+    /// Something was launched for these repositories: expect changes soon.
+    Touch { paths: Vec<String> },
+    /// The user is looking (window activated): catch up right away.
+    Activated,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
